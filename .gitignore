@@ -11,3 +11,4 @@ stubs/
 progress-assets/
 PROGRESS.md
 deps/
+.secrets/
