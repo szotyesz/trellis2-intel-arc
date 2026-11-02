@@ -12,3 +12,5 @@ progress-assets/
 PROGRESS.md
 deps/
 .secrets/
+input/
+out/

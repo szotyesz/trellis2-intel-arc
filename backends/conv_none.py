@@ -1,11 +1,8 @@
 """
 Pure-PyTorch sparse 3D convolution backend.
 
-Implements submanifold sparse convolution by gathering neighbor features,
-applying convolution weights via matrix multiply, and scatter-adding results.
-No CUDA extensions needed — works on MPS and CPU.
-
-Slower than flex_gemm/spconv but fully portable.
+Implements submanifold sparse convolution with one gather, matmul and
+index_add per kernel slot. Needs no CUDA extensions: works on XPU and CPU.
 """
 
 import math
@@ -41,88 +38,65 @@ def sparse_conv3d_init(self, in_channels, out_channels, kernel_size, stride=1, d
     self.weight = nn.Parameter(self.weight.permute(0, 2, 3, 4, 1).contiguous())
 
 
-def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
-    """
-    Submanifold sparse 3D convolution via gather-scatter.
+def _neighbor_map(coords, kernel_size, dilation):
+    """[N, V] int32 map: index of the active voxel at each kernel slot, or -1."""
+    Kd, Kh, Kw = kernel_size
+    reach = torch.tensor(
+        [0, (Kd // 2) * dilation[0], (Kh // 2) * dilation[1], (Kw // 2) * dilation[2]],
+        device=coords.device,
+    )
+    # Shift so neighbors stay non-negative; the keys are then unique per position.
+    c = coords.long() + reach
+    extent = c.amax(dim=0) + reach + 1
+    scale = torch.stack([extent[1] * extent[2] * extent[3], extent[2] * extent[3], extent[3], torch.ones_like(extent[3])])
+    keys = (c * scale).sum(dim=1)
+    sorted_keys, order = torch.sort(keys)
 
-    For each active voxel, gather features from its kernel-sized neighborhood
-    (only where other active voxels exist), multiply by the corresponding
-    kernel weight, and scatter-add results back.
-    """
-    Co, Kd, Kh, Kw, Ci = self.weight.shape
-    device = x.feats.device
-    dtype = x.feats.dtype
-
-    coords = x.coords  # [N, 4] (batch_idx, z, y, x)
-    feats = x.feats    # [N, Ci]
     N = coords.shape[0]
+    neighbor = torch.full((N, Kd * Kh * Kw), -1, dtype=torch.int32, device=coords.device)
+    for kd in range(Kd):
+        for kh in range(Kh):
+            for kw in range(Kw):
+                offset = (
+                    (kd - Kd // 2) * dilation[0] * scale[1]
+                    + (kh - Kh // 2) * dilation[1] * scale[2]
+                    + (kw - Kw // 2) * dilation[2] * scale[3]
+                )
+                query = keys + offset
+                pos = torch.searchsorted(sorted_keys, query).clamp_max(N - 1)
+                hit = sorted_keys[pos] == query
+                neighbor[hit, kd * Kh * Kw + kh * Kw + kw] = order[pos[hit]].int()
+    return neighbor
 
-    # Build neighbor index cache (reused across forward passes for same coords)
+
+def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
+    Co, Kd, Kh, Kw, Ci = self.weight.shape
+    feats = x.feats
+    N = feats.shape[0]
+
     cache_key = f'SubMConv3d_naive_neighbor_{Kw}x{Kh}x{Kd}_dilation{self.dilation}'
-    neighbor_cache = x.get_spatial_cache(cache_key)
+    neighbor = x.get_spatial_cache(cache_key)
+    if neighbor is None:
+        neighbor = _neighbor_map(x.coords, (Kd, Kh, Kw), self.dilation)
+        x.register_spatial_cache(cache_key, neighbor)
 
-    if neighbor_cache is None:
-        # Build spatial hash: coord tuple -> voxel index
-        coord_to_idx = {}
-        coords_cpu = coords.cpu()
-        for i in range(N):
-            key = tuple(coords_cpu[i].tolist())
-            coord_to_idx[key] = i
+    V = Kd * Kh * Kw
+    w = self.weight.reshape(Co, V, Ci).permute(1, 2, 0)  # (V, Ci, Co)
 
-        # For each kernel position, find (source, target) voxel pairs
-        dz, dy, dx = self.dilation
-        src_indices = []
-        tgt_indices = []
-        kernel_indices = []
-
-        for kz in range(Kd):
-            for ky in range(Kh):
-                for kx in range(Kw):
-                    oz = (kz - Kd // 2) * dz
-                    oy = (ky - Kh // 2) * dy
-                    ox = (kx - Kw // 2) * dx
-                    k_idx = kz * Kh * Kw + ky * Kw + kx
-
-                    for i in range(N):
-                        b, z, y, xc = coords_cpu[i].tolist()
-                        neighbor_key = (b, z + oz, y + oy, xc + ox)
-                        if neighbor_key in coord_to_idx:
-                            j = coord_to_idx[neighbor_key]
-                            src_indices.append(j)
-                            tgt_indices.append(i)
-                            kernel_indices.append(k_idx)
-
-        neighbor_cache = (
-            torch.tensor(src_indices, dtype=torch.long, device=device),
-            torch.tensor(tgt_indices, dtype=torch.long, device=device),
-            torch.tensor(kernel_indices, dtype=torch.long, device=device),
-        )
-        x.register_spatial_cache(cache_key, neighbor_cache)
-
-    src_idx, tgt_idx, k_idx = neighbor_cache
-
-    # Reshape weight: (Co, Kd, Kh, Kw, Ci) -> (K, Ci, Co)
-    K_total = Kd * Kh * Kw
-    w = self.weight.reshape(Co, K_total, Ci).permute(1, 2, 0)  # (K, Ci, Co)
-
-    out = torch.zeros(N, Co, device=device, dtype=dtype)
-
-    if len(src_idx) > 0:
-        # Process each kernel position to keep memory bounded
-        for k in range(K_total):
-            mask = (k_idx == k)
-            if not mask.any():
-                continue
-            s_idx = src_idx[mask]
-            t_idx = tgt_idx[mask]
-            src_f = feats[s_idx]                    # [E_k, Ci]
-            edge_out = src_f @ w[k]                 # [E_k, Co]
-            out.scatter_add_(0, t_idx.unsqueeze(1).expand(-1, Co), edge_out)
+    # Accumulate in fp32 like FlexGEMM's kernels, even for fp16 inputs.
+    out = torch.zeros(N, Co, device=feats.device, dtype=torch.float32)
+    for v in range(V):
+        slot = neighbor[:, v]
+        target = (slot >= 0).nonzero().squeeze(1)
+        if target.numel() == 0:
+            continue
+        source = feats.index_select(0, slot[target].long())
+        out.index_add_(0, target, (source @ w[v]).float())
 
     if self.bias is not None:
-        out = out + self.bias
+        out = out + self.bias.float()
 
-    return x.replace(out)
+    return x.replace(out.to(feats.dtype))
 
 
 def sparse_inverse_conv3d_init(self, *args, **kwargs):

@@ -1,8 +1,7 @@
 """
 Pure-Python/PyTorch mesh extraction from sparse voxel dual-grid.
 
-Replaces the CUDA-only o_voxel._C hashmap operations with Python dicts.
-Produces identical output to the CUDA version for inference.
+Replaces the CUDA-only o_voxel._C hashmap with a sorted-key lookup.
 """
 
 import torch
@@ -83,12 +82,11 @@ def flexible_dual_grid_to_mesh(
 
     N = dual_vertices.shape[0]
 
-    # Build coordinate lookup on CPU
-    coords_cpu = coords.cpu()
-    coord_to_idx = {}
-    for i in range(N):
-        key = (coords_cpu[i, 0].item(), coords_cpu[i, 1].item(), coords_cpu[i, 2].item())
-        coord_to_idx[key] = i
+    # Sorted-key lookup of active voxels. Offsets reach +1, so extent covers them.
+    c = coords.long()
+    extent = c.amax(dim=0) + 2
+    scale = torch.stack([extent[1] * extent[2], extent[2], torch.ones_like(extent[2])])
+    sorted_keys, order = torch.sort((c * scale).sum(dim=1))
 
     # Find connected voxels for each intersected edge
     edge_neighbor_voxel = coords.reshape(N, 1, 1, 3) + _edge_neighbor_voxel_offset
@@ -98,14 +96,11 @@ def flexible_dual_grid_to_mesh(
     if M == 0:
         return torch.zeros(0, 3, device=device), torch.zeros(0, 3, dtype=torch.long, device=device)
 
-    # Look up neighbor indices via dict
-    connected_cpu = connected_voxel.cpu().reshape(-1, 3)
-    indices = []
-    for j in range(connected_cpu.shape[0]):
-        key = (connected_cpu[j, 0].item(), connected_cpu[j, 1].item(), connected_cpu[j, 2].item())
-        indices.append(coord_to_idx.get(key, 0xFFFFFFFF))
-
-    connected_voxel_indices = torch.tensor(indices, dtype=torch.int64, device=device).reshape(M, 4)
+    # Look up neighbor indices
+    query = (connected_voxel.long().reshape(-1, 3) * scale).sum(dim=1)
+    pos = torch.searchsorted(sorted_keys, query).clamp_max(N - 1)
+    hit = sorted_keys[pos] == query
+    connected_voxel_indices = torch.where(hit, order[pos], torch.full_like(pos, 0xFFFFFFFF)).reshape(M, 4)
     connected_voxel_valid = (connected_voxel_indices != 0xFFFFFFFF).all(dim=1)
     quad_indices = connected_voxel_indices[connected_voxel_valid].long()
     L = quad_indices.shape[0]

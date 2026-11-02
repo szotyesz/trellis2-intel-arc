@@ -1,0 +1,11 @@
+.git
+.secrets/
+input/
+out/
+deps/
+stubs/
+TRELLIS.2/
+.venv/
+docs/
+assets/
+**/__pycache__

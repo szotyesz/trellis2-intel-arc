@@ -1,17 +1,19 @@
 """
-UV unwrap + texture baking for TRELLIS.2 meshes on Apple Silicon.
+UV unwrap, texture baking and GLB export for TRELLIS.2 meshes.
 
-Replaces nvdiffrast (CUDA-only) with:
-  - xatlas for UV unwrapping (C++ library, CPU)
-  - Vectorized numpy rasterizer for UV-space triangles
-  - scipy cKDTree for nearest-voxel lookup at native 512 resolution
-  - Inverse-distance weighting for trilinear-like interpolation
-
-Produces GLB files with PBR textures (base color, metallic, roughness).
+Matches the behaviour of upstream's o_voxel.postprocess.to_glb without its
+dependencies. Do not import that module: it imports nvdiffrast, whose licence
+forbids commercial use.
+  - xatlas for UV unwrapping
+  - NumPy UV-space rasteriser
+  - Sparse trilinear sampling, same weights as FlexGEMM's grid_sample_3d
+  - cv2.inpaint for gaps between UV charts
 """
 
-import numpy as np
 import time
+
+import cv2
+import numpy as np
 
 
 def uv_unwrap(vertices, faces):
@@ -112,151 +114,90 @@ def _rasterize_uv_triangles(vertices, faces, uvs, texture_size):
     return positions, mask
 
 
-def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_size,
-                 texture_size=2048, k_neighbors=8, **kwargs):
+def sample_sparse_trilinear(coords, attrs, query):
+    """Sample sparse voxels at continuous voxel-space points.
+
+    Returns [M, C] values and [M] bool, False where no neighbor voxel is active.
     """
-    Bake voxel attributes into a UV-mapped texture.
+    coords = np.asarray(coords, dtype=np.int64)
+    extent = coords.max(axis=0) + 3
+    scale = np.array([extent[1] * extent[2], extent[2], 1], dtype=np.int64)
+    keys = coords @ scale
+    order = np.argsort(keys)
+    sorted_keys = keys[order]
 
-    Uses scipy cKDTree on sparse voxels for k-nearest-neighbor lookup
-    with inverse-distance weighting. Avoids dense 3D volume entirely,
-    preserving native voxel resolution without memory pressure.
+    base = np.floor(query - 0.5).astype(np.int64)
+    out = np.zeros((len(query), attrs.shape[1]), dtype=np.float32)
+    weight_sum = np.zeros(len(query), dtype=np.float32)
+    for corner in range(8):
+        voxel = base + np.array([corner & 1, (corner >> 1) & 1, (corner >> 2) & 1])
+        inside = ((voxel >= 0) & (voxel < extent)).all(axis=1)
+        q = voxel @ scale
+        pos = np.searchsorted(sorted_keys, q).clip(max=len(keys) - 1)
+        hit = inside & (sorted_keys[pos] == q)
+        w = np.prod(1 - np.abs(query[hit] - voxel[hit] - 0.5), axis=1)
+        out[hit] += w[:, None] * attrs[order[pos[hit]]]
+        weight_sum[hit] += w
+    valid = weight_sum > 0
+    out[valid] /= weight_sum[valid, None]
+    return out, valid
 
-    Pipeline:
-      1. UV rasterize → 3D position per texel
-      2. KDTree on sparse voxels
-      3. For each texel: k-nearest voxels, inverse-distance-weighted average
-      4. Gamma correct, fill holes, export
+
+def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_size, texture_size=2048):
+    """Bake voxel attributes into textures.
+
+    Attribute layout: base colour 0:3, metallic 3, roughness 4, alpha 5.
+    Returns the RGB base colour image, the glTF metallic-roughness image, and
+    the share of covered texels that had a voxel to sample.
     """
-    from scipy.spatial import cKDTree
-
-    H = W = texture_size
     t0 = time.time()
-
-    coords_np = voxel_coords.numpy() if hasattr(voxel_coords, 'numpy') else voxel_coords
-    attrs_np = voxel_attrs.numpy() if hasattr(voxel_attrs, 'numpy') else voxel_attrs
-    origin_np = origin.numpy() if hasattr(origin, 'numpy') else np.array(origin)
-
-    C = attrs_np.shape[1]
-    n_voxels = len(coords_np)
-    print(f"  Voxels: {n_voxels:,}, channels: {C}")
-
-    # Voxel world-space positions (voxel centers)
-    voxel_world = coords_np.astype(np.float32) * voxel_size + origin_np + voxel_size * 0.5
-
-    # Build KDTree on voxel positions
-    print(f"  Building KDTree...")
-    t_tree = time.time()
-    tree = cKDTree(voxel_world)
-    print(f"    Tree built in {time.time() - t_tree:.1f}s")
-
-    # Rasterize UV triangles to 3D positions
-    print(f"  Rasterizing {len(faces):,} triangles into {texture_size}x{texture_size}...")
-    t_rast = time.time()
     positions, mask = _rasterize_uv_triangles(vertices, faces, uvs, texture_size)
-    coverage = mask.sum() / (H * W) * 100
-    print(f"    Coverage: {coverage:.1f}%, rasterized in {time.time() - t_rast:.1f}s")
+    query = (positions[mask] - np.asarray(origin)) / voxel_size
+    sampled, valid = sample_sparse_trilinear(voxel_coords, np.asarray(voxel_attrs), query)
+    hit_rate = float(valid.mean()) if len(valid) else 0.0
+    print(f"  Texels: {len(valid):,}, with voxel data: {hit_rate:.2%}, {time.time() - t0:.1f}s")
 
-    # For each valid texel, find k nearest voxels
-    query_points = positions[mask]  # [M, 3]
-    M = len(query_points)
-    print(f"  Querying {M:,} texels, k={k_neighbors}...")
-    t_q = time.time()
-    distances, indices = tree.query(query_points, k=k_neighbors, workers=-1)
-    # distances: [M, k], indices: [M, k]
-    print(f"    Query done in {time.time() - t_q:.1f}s")
+    filled = np.zeros_like(mask)
+    filled[mask] = valid
+    image = np.zeros((texture_size, texture_size, sampled.shape[1]), dtype=np.uint8)
+    image[mask] = (np.clip(sampled, 0, 1) * 255).astype(np.uint8)
 
-    # Inverse-distance weighted average. Use distance threshold to skip far voxels.
-    # voxel_size is world units per voxel; 2x voxel_size = reasonable neighborhood
-    max_dist = voxel_size * 2.0
-    print(f"  Weighting colors (max_dist = {max_dist:.4f})...")
+    # Fill everything outside the sampled texels, so UV seams do not show black.
+    gaps = (~filled).astype(np.uint8)
+    base_color = cv2.inpaint(image[..., :3], gaps, 3, cv2.INPAINT_TELEA)
+    metallic = cv2.inpaint(image[..., 3], gaps, 1, cv2.INPAINT_TELEA)
+    roughness = cv2.inpaint(image[..., 4], gaps, 1, cv2.INPAINT_TELEA)
 
-    # Weights: 1 / (d + eps), but zero weight for distances > max_dist
-    eps = voxel_size * 0.1
-    weights = 1.0 / (distances + eps)
-    weights[distances > max_dist] = 0.0
-    weights_sum = weights.sum(axis=1, keepdims=True)
-
-    # Find texels with at least one nearby voxel
-    has_neighbor = (weights_sum > 0).squeeze()
-
-    # Normalize weights
-    weights = np.where(weights_sum > 0, weights / np.maximum(weights_sum, 1e-10), 0.0)
-
-    # Gather colors: attrs_np[indices] → [M, k, C]
-    neighbor_attrs = attrs_np[indices]  # [M, k, C]
-
-    # Weighted sum over k dimension
-    sampled = (neighbor_attrs * weights[..., None]).sum(axis=1)  # [M, C]
-
-    # Write texture
-    base_color = np.zeros((H, W, 3), dtype=np.float32)
-    metallic = np.zeros((H, W), dtype=np.float32)
-    roughness = np.ones((H, W), dtype=np.float32)
-
-    ys, xs = np.where(mask)
-    valid = has_neighbor
-    base_color[ys[valid], xs[valid]] = np.clip(sampled[valid, 0:3], 0, 1)
-    if C > 3:
-        metallic[ys[valid], xs[valid]] = np.clip(sampled[valid, 3], 0, 1)
-    if C > 4:
-        roughness[ys[valid], xs[valid]] = np.clip(sampled[valid, 4], 0, 1)
-
-    valid_mask = np.zeros((H, W), dtype=bool)
-    valid_mask[ys[valid], xs[valid]] = True
-
-    # Fill holes via iterative dilation
-    from scipy.ndimage import binary_dilation, uniform_filter
-    current_mask = valid_mask.copy()
-    for _ in range(8):
-        dilated = binary_dilation(current_mask, iterations=1)
-        unfilled = dilated & ~current_mask
-        if not unfilled.any():
-            break
-        for c in range(3):
-            channel = base_color[:, :, c]
-            blurred = uniform_filter(channel, size=3)
-            channel[unfilled] = blurred[unfilled]
-        current_mask = dilated
-
-    # Gamma correction: linear -> sRGB
-    base_color = np.power(np.clip(base_color, 0, 1), 1.0 / 2.2)
-
-    base_color_img = (base_color * 255).astype(np.uint8)
-
-    # glTF metallic-roughness: R=0, G=roughness, B=metallic
-    mr_img = np.zeros((H, W, 3), dtype=np.uint8)
-    mr_img[:, :, 1] = (roughness * 255).astype(np.uint8)
-    mr_img[:, :, 2] = (metallic * 255).astype(np.uint8)
-
-    total_coverage = current_mask.sum() / (H * W) * 100
-    print(f"  Final coverage: {total_coverage:.1f}%, total bake: {time.time() - t0:.1f}s")
-
-    return base_color_img, mr_img, current_mask
+    # glTF packs roughness in G and metallic in B.
+    mr = np.stack([np.zeros_like(metallic), roughness, metallic], axis=-1)
+    return base_color, mr, hit_rate
 
 
-def export_glb_with_texture(vertices, faces, uvs, base_color_img, mr_img=None, output_path="output.glb"):
-    """Export mesh with UV-mapped PBR textures as GLB."""
+def export_glb_with_texture(vertices, faces, uvs, base_color_img, mr_img, output_path, normals=None):
+    """Export a textured GLB, converting to glTF's Y-up axes."""
     import trimesh
     from PIL import Image
 
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    v = np.array(vertices, dtype=np.float32)
+    v[:, 1], v[:, 2] = v[:, 2].copy(), -v[:, 1]
+    if normals is not None:
+        normals = np.array(normals, dtype=np.float32)
+        normals[:, 1], normals[:, 2] = normals[:, 2].copy(), -normals[:, 1]
 
-    base_color_pil = Image.fromarray(base_color_img)
+    # trimesh flips V again on export, so texture row r ends up at glTF v = r / H.
+    uv = np.array(uvs, dtype=np.float32)
+    uv[:, 1] = 1 - uv[:, 1]
 
     material = trimesh.visual.material.PBRMaterial(
-        baseColorTexture=base_color_pil,
-        metallicFactor=0.0,
-        roughnessFactor=0.8,
+        baseColorTexture=Image.fromarray(base_color_img),
+        metallicRoughnessTexture=Image.fromarray(mr_img),
+        metallicFactor=1.0,
+        roughnessFactor=1.0,
+        doubleSided=True,
     )
-
-    if mr_img is not None:
-        mr_pil = Image.fromarray(mr_img)
-        material.metallicRoughnessTexture = mr_pil
-
-    mesh.visual = trimesh.visual.TextureVisuals(
-        uv=uvs,
-        material=material,
+    mesh = trimesh.Trimesh(
+        vertices=v, faces=faces, vertex_normals=normals, process=False,
+        visual=trimesh.visual.TextureVisuals(uv=uv, material=material),
     )
-
     mesh.export(output_path)
     return output_path

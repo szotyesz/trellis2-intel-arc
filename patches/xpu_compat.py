@@ -1,11 +1,11 @@
 """
-Apply all MPS compatibility patches to a fresh TRELLIS.2 clone.
+Apply all XPU patches to a fresh TRELLIS.2 clone.
 
 Modifies source files in-place to replace CUDA-only code paths with
-device-agnostic alternatives that work on Apple Silicon (MPS).
+device-aware code for Intel GPUs (XPU).
 
 Run once after cloning TRELLIS.2:
-    python patches/mps_compat.py
+    python patches/xpu_compat.py
 """
 
 import os
@@ -18,6 +18,13 @@ BACKENDS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 def read_file(path):
     with open(path, "r") as f:
         return f.read()
+
+
+def must_replace(src, old, new, count=-1):
+    """str.replace that fails instead of silently leaving a half-patched tree."""
+    if old not in src:
+        raise SystemExit(f"Patch target not found, upstream changed?\n{old}")
+    return src.replace(old, new, count)
 
 
 def write_file(path, content):
@@ -35,7 +42,7 @@ def patch_sparse_config():
         print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
         return
 
-    src = src.replace(
+    src = must_replace(src,
         "env_sparse_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3']",
         "env_sparse_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3', 'sdpa', 'naive']",
     )
@@ -51,45 +58,26 @@ def patch_sparse_attention():
         print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
         return
 
+    # One sample only: the padded multi-sample form passed no mask, so shorter
+    # samples would attend to padding. The last dim must keep stride 1, which
+    # the fused oneDNN backend requires.
     sdpa_block = """\
     elif config.ATTN in ('sdpa', 'naive'):
         from torch.nn.functional import scaled_dot_product_attention as sdpa_fn
+        if len(q_seqlen) != 1:
+            raise NotImplementedError("The sdpa backend supports one sample at a time")
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)
         elif num_all_args == 2:
             k, v = kv.unbind(dim=1)
-        H = q.shape[-2]
-        max_q = max(q_seqlen)
-        max_kv = max(kv_seqlen) if kv_seqlen is not None else max_q
-        B = len(q_seqlen)
-        C_q = q.shape[-1]
-        C_v = v.shape[-1]
-        q_padded = torch.zeros(B, max_q, H, C_q, device=device, dtype=q.dtype)
-        k_padded = torch.zeros(B, max_kv, H, C_q, device=device, dtype=k.dtype)
-        v_padded = torch.zeros(B, max_kv, H, C_v, device=device, dtype=v.dtype)
-        q_offset = 0
-        kv_offset = 0
-        for b in range(B):
-            ql = q_seqlen[b]
-            kvl = kv_seqlen[b] if kv_seqlen is not None else ql
-            q_padded[b, :ql] = q[q_offset:q_offset+ql]
-            k_padded[b, :kvl] = k[kv_offset:kv_offset+kvl]
-            v_padded[b, :kvl] = v[kv_offset:kv_offset+kvl]
-            q_offset += ql
-            kv_offset += kvl
-        q_padded = q_padded.permute(0, 2, 1, 3)
-        k_padded = k_padded.permute(0, 2, 1, 3)
-        v_padded = v_padded.permute(0, 2, 1, 3)
-        out_padded = sdpa_fn(q_padded, k_padded, v_padded)
-        out_padded = out_padded.permute(0, 2, 1, 3)
-        out_list = []
-        for b in range(B):
-            ql = q_seqlen[b]
-            out_list.append(out_padded[b, :ql])
-        out = torch.cat(out_list, dim=0)
+        out = sdpa_fn(
+            q.unsqueeze(0).transpose(1, 2),
+            k.unsqueeze(0).transpose(1, 2),
+            v.unsqueeze(0).transpose(1, 2),
+        ).transpose(1, 2).squeeze(0)
 """
 
-    src = src.replace(
+    src = must_replace(src,
         "    else:\n        raise ValueError(f\"Unknown attention module: {config.ATTN}\")",
         sdpa_block + "    else:\n        raise ValueError(f\"Unknown attention module: {config.ATTN}\")",
     )
@@ -106,7 +94,7 @@ def patch_image_feature_extractor():
         return
 
     # DinoV2FeatureExtractor: add device property, fix cuda()
-    src = src.replace(
+    src = must_replace(src,
         "    def to(self, device):\n"
         "        self.model.to(device)\n"
         "\n"
@@ -142,18 +130,18 @@ def patch_image_feature_extractor():
     )
 
     # Fix hardcoded .cuda() in both extractors
-    src = src.replace(
+    src = must_replace(src,
         "            image = torch.stack(image).cuda()",
         "            image = torch.stack(image).to(self.device)",
     )
-    src = src.replace(
+    src = must_replace(src,
         "        image = self.transform(image).cuda()",
         "        image = self.transform(image).to(self.device)",
     )
 
     # DinoV3FeatureExtractor: add device property, fix cuda()
     # The second class has the same to/cuda/cpu pattern
-    src = src.replace(
+    src = must_replace(src,
         "    def to(self, device):\n"
         "        self.model.to(device)\n"
         "\n"
@@ -178,7 +166,7 @@ def patch_image_feature_extractor():
     )
 
     # Fix DINOv3 model.layer -> model.model.layer (HuggingFace structure)
-    src = src.replace(
+    src = must_replace(src,
         "        for i, layer_module in enumerate(self.model.layer):",
         "        layers = self.model.model.layer if hasattr(self.model, 'model') and hasattr(self.model.model, 'layer') else self.model.layer\n"
         "        for i, layer_module in enumerate(layers):",
@@ -187,56 +175,38 @@ def patch_image_feature_extractor():
     write_file(path, src)
 
 
-def patch_birefnet():
-    """Add device property and fix hardcoded .cuda()/.to('cuda') calls."""
-    path = os.path.join(TRELLIS_ROOT, "trellis2/pipelines/rembg/BiRefNet.py")
+def patch_no_rembg():
+    """RMBG-2.0 is CC BY-NC, so it must never load. Input must be RGBA."""
+    path = os.path.join(TRELLIS_ROOT, "trellis2/pipelines/trellis2_image_to_3d.py")
     src = read_file(path)
 
-    if "def device(self)" in src:
+    if "XPU_NO_REMBG" in src:
         print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
         return
 
-    # Replace to/cuda/cpu block
-    src = src.replace(
-        "    def to(self, device: str):\n"
-        "        self.model.to(device)\n"
-        "\n"
-        "    def cuda(self):\n"
-        "        self.model.cuda()\n"
-        "\n"
-        "    def cpu(self):\n"
-        "        self.model.cpu()",
-
-        "    @property\n"
-        "    def device(self):\n"
-        "        return next(self.model.parameters()).device\n"
-        "\n"
-        "    def to(self, device):\n"
-        "        self.model.to(device)\n"
-        "        return self\n"
-        "\n"
-        "    def cuda(self):\n"
-        "        self.model.to(self.device)\n"
-        "\n"
-        "    def cpu(self):\n"
-        "        self.model.cpu()",
+    src = must_replace(src,
+        "        pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])\n",
+        "        pipeline.rembg_model = None  # XPU_NO_REMBG\n",
     )
-
-    # Fix hardcoded .to("cuda") in __call__
-    src = src.replace(
-        '.unsqueeze(0).to("cuda")',
-        ".unsqueeze(0).to(self.device)",
+    src = must_replace(src,
+        "            input = input.convert('RGB')\n"
+        "            if self.low_vram:\n"
+        "                self.rembg_model.to(self.device)\n"
+        "            output = self.rembg_model(input)\n"
+        "            if self.low_vram:\n"
+        "                self.rembg_model.cpu()\n",
+        "            raise ValueError(\n"
+        "                'The input image has no transparency. Cut out the object first '\n"
+        "                'and pass an RGBA image.'\n"
+        "            )\n",
     )
-
     write_file(path, src)
 
 
 def patch_mesh_base():
     """Guard cumesh/flex_gemm imports and unconditionally skip in-place mesh
-    ops. TRELLIS.2 calls fill_holes/remove_faces/simplify during decode on the
-    full 400K-vertex mesh; the Metal port of cumesh segfaults on inputs that
-    large, so we skip these decode-time ops entirely. Post-decode mesh
-    simplification happens later via fast_simplification before texture bake.
+    ops. cumesh is CUDA-only and not installed. Mesh simplification happens
+    later via fast_simplification before texture bake.
     """
     path = os.path.join(TRELLIS_ROOT, "trellis2/representations/mesh/base.py")
     src = read_file(path)
@@ -246,7 +216,7 @@ def patch_mesh_base():
         return
 
     # Guard imports — cumesh/flex_gemm may or may not be present
-    src = src.replace(
+    src = must_replace(src,
         "import cumesh\n"
         "from flex_gemm.ops.grid_sample import grid_sample_3d",
         "try:\n"
@@ -260,19 +230,19 @@ def patch_mesh_base():
         '        raise RuntimeError("flex_gemm requires CUDA")',
     )
 
-    # Unconditionally return from fill_holes (Metal cumesh segfaults on large meshes)
-    src = src.replace(
+    # cumesh is absent, so these become no-ops
+    src = must_replace(src,
         "    def fill_holes(self, max_hole_perimeter=3e-2):\n"
         "        vertices = self.vertices.cuda()\n"
         "        faces = self.faces.cuda()",
         "    def fill_holes(self, max_hole_perimeter=3e-2):\n"
-        "        return  # Skip — Metal cumesh segfaults on large decode meshes\n"
+        "        return  # cumesh is not installed on this path\n"
         "        vertices = self.vertices.to(self.device)\n"
         "        faces = self.faces.to(self.device)",
     )
 
     # Unconditionally return from remove_faces
-    src = src.replace(
+    src = must_replace(src,
         "    def remove_faces(self, face_mask: torch.Tensor):\n"
         "        vertices = self.vertices.cuda()\n"
         "        faces = self.faces.cuda()",
@@ -283,7 +253,7 @@ def patch_mesh_base():
     )
 
     # Unconditionally return from simplify
-    src = src.replace(
+    src = must_replace(src,
         "    def simplify(self, target=1000000, verbose: bool=False, options: dict={}):\n"
         "        vertices = self.vertices.cuda()\n"
         "        faces = self.faces.cuda()",
@@ -308,10 +278,9 @@ def patch_fdg_vae():
         print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
         return
 
-    src = src.replace(
+    src = must_replace(src,
         "from o_voxel.convert import flexible_dual_grid_to_mesh\n",
-        "# Force pure-Python mesh extraction — real o_voxel.convert (CUDA or Metal port)\n"
-        "# segfaults on decoder output. Import our stub version explicitly.\n"
+        "# Use our mesh extraction: upstream o_voxel.convert needs CUDA.\n"
         "# stubs/ is appended (not prepended) so a pip-installed o_voxel still wins\n"
         "# for other submodules like o_voxel.postprocess.\n"
         "import sys, os\n"
@@ -331,18 +300,17 @@ def patch_fdg_vae():
 
 
 def patch_pipeline():
-    """Guard torch.cuda.empty_cache() call."""
+    """Use the XPU cache call."""
     path = os.path.join(TRELLIS_ROOT, "trellis2/pipelines/trellis2_image_to_3d.py")
     src = read_file(path)
 
-    if "if torch.cuda.is_available():" in src:
+    if "torch.xpu.empty_cache()" in src:
         print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
         return
 
-    src = src.replace(
+    src = must_replace(src,
         "        torch.cuda.empty_cache()\n",
-        "        if torch.cuda.is_available():\n"
-        "            torch.cuda.empty_cache()\n",
+        "        torch.xpu.empty_cache()\n",
     )
     write_file(path, src)
 
@@ -352,13 +320,13 @@ def patch_pipeline_base():
     path = os.path.join(TRELLIS_ROOT, "trellis2/pipelines/base.py")
     src = read_file(path)
 
-    if "torch.backends.mps.is_available()" in src:
+    if 'torch.device("xpu")' in src:
         print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
         return
 
-    src = src.replace(
+    src = must_replace(src,
         '        self.to(torch.device("cuda"))',
-        '        self.to(torch.device("mps") if torch.backends.mps.is_available() else torch.device("cuda"))',
+        '        self.to(torch.device("xpu"))',
     )
     write_file(path, src)
 
@@ -413,29 +381,20 @@ def install_mesh_extract():
         f.write('        raise RuntimeError("o_voxel.rasterize requires CUDA")\n')
 
 
-def install_stubs():
-    """Create all stub modules for CUDA-only libraries."""
-    stubs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "stubs")
-
-    from backends.stubs import install_stubs as _install
-    _install(stubs_dir)
-    print(f"  Installed stub packages in stubs/")
-
-
 def main():
-    print("Applying MPS compatibility patches to TRELLIS.2...")
+    print("Applying XPU patches to TRELLIS.2...")
     print(f"  TRELLIS root: {TRELLIS_ROOT}")
     print()
 
     if not os.path.isdir(TRELLIS_ROOT):
         print(f"Error: TRELLIS.2 not found at {TRELLIS_ROOT}")
-        print("Run setup.sh first to clone the repository.")
+        print("The Dockerfile clones it at a pinned commit.")
         return False
 
     patch_sparse_config()
     patch_sparse_attention()
     patch_image_feature_extractor()
-    patch_birefnet()
+    patch_no_rembg()
     patch_mesh_base()
     patch_fdg_vae()
     patch_pipeline()
