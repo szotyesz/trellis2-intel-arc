@@ -3,6 +3,7 @@ Generate a textured 3D mesh from an RGBA image using TRELLIS.2 on an Intel GPU.
 """
 
 import argparse
+import gc
 import os
 import sys
 import time
@@ -37,7 +38,9 @@ def main():
     parser.add_argument("--pipeline-type", default="512", choices=["512", "1024", "1024_cascade", "1536_cascade"])
     parser.add_argument("--max-tokens", type=int, default=49152)
     parser.add_argument("--texture-size", type=int, default=1024, choices=[512, 1024, 2048, 4096])
-    parser.add_argument("--no-texture", action="store_true", help="Export geometry only")
+    parser.add_argument("--no-texture", action="store_true", help="Export the raw mesh as OBJ only")
+    parser.add_argument("--save-raw", action="store_true", help="Also write the raw mesh as OBJ (hundreds of MB)")
+    parser.add_argument("--target-faces", type=int, default=200000, help="Triangles in the final GLB")
     parser.add_argument("--steps", type=int, default=None, help="Override sampler steps for all phases")
     args = parser.parse_args()
 
@@ -75,30 +78,40 @@ def main():
     faces = mesh.faces.cpu().numpy()
     print(f"Mesh: {len(verts):,} vertices, {len(faces):,} triangles")
 
-    with open(f"{args.output}.obj", "w") as f:
-        np.savetxt(f, verts, fmt="v %.6f %.6f %.6f")
-        np.savetxt(f, faces + 1, fmt="f %d %d %d")
+    if args.no_texture or args.save_raw:
+        with open(f"{args.output}.obj", "w") as f:
+            np.savetxt(f, verts, fmt="v %.6f %.6f %.6f")
+            np.savetxt(f, faces + 1, fmt="f %d %d %d")
 
     if args.no_texture:
         return
 
-    import fast_simplification
     import trimesh
 
     sys.path.insert(0, ROOT)
-    from backends.texture_baker import bake_texture, export_glb_with_texture, uv_unwrap
+    from backends.texture_baker import bake_texture, export_glb_with_texture, simplify_mesh, uv_unwrap
+
+    # Baking runs on the CPU: release the models and the raw GPU mesh first.
+    coords = mesh.coords.cpu().numpy()
+    attrs = mesh.attrs.cpu().float().numpy()
+    origin = mesh.origin.cpu().numpy()
+    voxel_size = mesh.voxel_size
+    del mesh, pipeline
+    gc.collect()
+    torch.xpu.empty_cache()
 
     t0 = time.time()
-    target = min(200000, len(faces))
-    bake_verts, bake_faces = verts, faces
-    if len(faces) > target:
-        bake_verts, bake_faces = fast_simplification.simplify(verts, faces, 1.0 - target / len(faces))
+    bake_verts, bake_faces = simplify_mesh(verts, faces, args.target_faces)
+    del verts, faces
+    gc.collect()
+    print(f"Simplified to {len(bake_faces):,} triangles in {time.time() - t0:.0f}s")
     normals = trimesh.Trimesh(bake_verts, bake_faces, process=False).vertex_normals
+    t0 = time.time()
     new_verts, new_faces, uvs, vmapping = uv_unwrap(bake_verts, bake_faces)
+    print(f"Unwrapped in {time.time() - t0:.0f}s")
+    t0 = time.time()
     base_color, mr, _ = bake_texture(
-        new_verts, new_faces, uvs,
-        mesh.coords.cpu().numpy(), mesh.attrs.cpu().float().numpy(),
-        mesh.origin.cpu().numpy(), mesh.voxel_size,
+        new_verts, new_faces, uvs, coords, attrs, origin, voxel_size,
         texture_size=args.texture_size,
     )
     export_glb_with_texture(new_verts, new_faces, uvs, base_color, mr, f"{args.output}.glb", normals=normals[vmapping])

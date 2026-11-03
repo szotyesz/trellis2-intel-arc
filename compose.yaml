@@ -7,9 +7,12 @@ services:
     devices: ["/dev/dri:/dev/dri"]
     group_add: ["983", "987"]   # host video and render
     ipc: host
+    mem_limit: 26g          # fail this job, not the host
+    memswap_limit: 26g
     cap_add: [IPC_LOCK]
     ulimits: { memlock: { soft: -1, hard: -1 } }
     environment:
+      PYTHONUNBUFFERED: "1"
       HF_HOME: /cache/hf
       HF_HUB_OFFLINE: "1"
       ONEAPI_DEVICE_SELECTOR: level_zero:gpu

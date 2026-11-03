@@ -16,6 +16,98 @@ import cv2
 import numpy as np
 
 
+def orient_faces(vertices, faces):
+    """Make face winding consistent, facing outwards, as far as topology allows.
+
+    The dual-grid extractor winds quads by axis, not by surface side, and both
+    the simplifier and xatlas fail on that. Propagates winding over a BFS tree
+    of the manifold-edge face graph. These meshes contain odd cycles, so a
+    perfect assignment does not exist; the conflicts stay on tree-cut edges.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import breadth_first_order, connected_components
+
+    F = len(faces)
+    edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    face_ids = np.tile(np.arange(F), 3)
+    forward = edges[:, 0] < edges[:, 1]
+    keys = edges.min(axis=1) * (int(faces.max()) + 1) + edges.max(axis=1)
+    order = np.argsort(keys, kind="stable")
+    k = keys[order]
+    run_start = np.r_[True, k[1:] != k[:-1]]
+    run_id = np.cumsum(run_start) - 1
+    first = np.flatnonzero(run_start & (np.bincount(run_id)[run_id] == 2))
+    a, b = face_ids[order[first]], face_ids[order[first + 1]]
+    # Same traversal direction across a shared edge means opposite winding.
+    differ = forward[order[first]] == forward[order[first + 1]]
+
+    # A virtual root (node F) joins one face per surface, so BFS covers them all.
+    graph = coo_matrix((np.ones(len(a), dtype=np.int8), (a, b)), shape=(F, F))
+    _, surface = connected_components(graph, directed=False)
+    _, seeds = np.unique(surface, return_index=True)
+    rows = np.r_[a, np.full(len(seeds), F)]
+    cols = np.r_[b, seeds]
+    tree = coo_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)), shape=(F + 1, F + 1))
+    _, parent = breadth_first_order(tree.tocsr(), F, directed=False)
+    parent = parent.astype(np.int64)
+    parent[F] = F
+    parent[seeds] = F
+
+    # Flip relative to the parent, then accumulate to the root by pointer jumping.
+    lookup = np.r_[np.minimum(a, b) * (F + 1) + np.maximum(a, b)]
+    idx = np.argsort(lookup)
+    lookup, rel = lookup[idx], differ[idx]
+    child = np.setdiff1d(np.arange(F), seeds)
+    pair = np.minimum(child, parent[child]) * (F + 1) + np.maximum(child, parent[child])
+    flip = np.zeros(F + 1, dtype=bool)
+    flip[child] = rel[np.searchsorted(lookup, pair)]
+    while (parent != F).any():
+        flip = flip ^ flip[parent]
+        parent = parent[parent]
+    flip = flip[:F]
+    out = faces.copy()
+    out[flip] = out[flip][:, [0, 2, 1]]
+
+    # Point each surface outwards by the sign of its volume.
+    tri = np.asarray(vertices, dtype=np.float64)[out]
+    volume = np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2]))
+    inward = np.bincount(surface, weights=volume)[surface] < 0
+    out[inward] = out[inward][:, [0, 2, 1]]
+    return out
+
+
+def unweld_non_manifold(vertices, faces):
+    """Give faces on edges shared by 3+ faces private vertices. Removes no geometry.
+
+    The extractor produces many such edges. They stall the simplifier and make
+    xatlas take hours.
+    """
+    edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    keys = edges.min(axis=1) * (int(faces.max()) + 1) + edges.max(axis=1)
+    _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+    bad = (counts[inverse] > 2).reshape(3, -1).any(axis=0)
+    out = faces.copy()
+    out[bad] = len(vertices) + np.arange(3 * int(bad.sum())).reshape(-1, 3)
+    return np.vstack([vertices, vertices[faces[bad]].reshape(-1, 3)]), out
+
+
+def simplify_mesh(vertices, faces, target):
+    """Repair, then decimate to about `target` faces."""
+    import fast_simplification
+
+    v = np.asarray(vertices, dtype=np.float64)
+    v, f = unweld_non_manifold(v, orient_faces(v, faces))
+    # One call can stop early, so repeat until it reaches the target or stalls.
+    for _ in range(6):
+        if len(f) <= target * 1.05:
+            break
+        before = len(f)
+        v, f = fast_simplification.simplify(v, f, 1.0 - target / len(f))
+        if len(f) > before * 0.98:
+            break
+    return v, orient_faces(v, f)
+
+
 def uv_unwrap(vertices, faces):
     """
     Compute UV coordinates for a mesh using xatlas.

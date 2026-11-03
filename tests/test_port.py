@@ -123,3 +123,26 @@ def test_rmbg_never_loads():
 
 def test_token_not_in_image():
     assert not (ROOT / ".secrets").exists()
+
+
+def test_orient_faces_repairs_flipped_cube():
+    baker = load_baker()
+    box = trimesh.creation.box()
+    faces = np.array(box.faces)
+    flipped = faces.copy()
+    flipped[::3] = flipped[::3][:, [0, 2, 1]]
+    fixed = baker.orient_faces(np.array(box.vertices), flipped)
+    assert trimesh.Trimesh(box.vertices, fixed, process=False).is_winding_consistent
+    assert trimesh.Trimesh(box.vertices, fixed, process=False).volume > 0
+
+
+def test_unweld_keeps_geometry_and_removes_non_manifold_edges():
+    baker = load_baker()
+    # Three triangles sharing the edge 0-1.
+    v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1]], dtype=np.float64)
+    f = np.array([[0, 1, 2], [1, 0, 3], [0, 1, 4]])
+    nv, nf = baker.unweld_non_manifold(v, f)
+    assert len(nf) == 3
+    np.testing.assert_array_equal(nv[nf], v[f])
+    edges = np.sort(np.concatenate([nf[:, [0, 1]], nf[:, [1, 2]], nf[:, [2, 0]]]), axis=1)
+    assert np.unique(edges, axis=0, return_counts=True)[1].max() <= 2
