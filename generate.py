@@ -3,9 +3,11 @@ Generate a textured 3D mesh from an RGBA image using TRELLIS.2 on an Intel GPU.
 """
 
 import argparse
+import ctypes
 import gc
 import os
 import sys
+import threading
 import time
 
 # PYTORCH_ENABLE_XPU_FALLBACK stays unset, so a missing op raises an error
@@ -30,6 +32,67 @@ The GPU run failed. Common causes:
 """
 
 
+def rss_gib():
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**30
+
+
+def free_ram():
+    """Run the GC and hand freed heap pages back to the OS."""
+    gc.collect()
+    torch.xpu.empty_cache()
+    ctypes.CDLL("libc.so.6").malloc_trim(0)
+
+
+# Models no later stage needs. System RAM, not VRAM, is what runs out here.
+RELEASE_AFTER = {
+    "sample_sparse_structure": ("sparse_structure_flow_model", "sparse_structure_decoder"),
+    "sample_shape_slat": ("shape_slat_flow_model_512", "shape_slat_flow_model_1024"),
+    "sample_shape_slat_cascade": ("shape_slat_flow_model_512", "shape_slat_flow_model_1024"),
+    "sample_tex_slat": ("tex_slat_flow_model_512", "tex_slat_flow_model_1024"),
+    "decode_shape_slat": ("shape_slat_decoder",),
+    "decode_tex_slat": ("tex_slat_decoder",),
+}
+
+
+def instrument_stages(pipeline):
+    """Print peak RAM and VRAM per pipeline stage, and release finished models."""
+    peak = [0.0]
+
+    def sample():
+        while True:
+            peak[0] = max(peak[0], rss_gib())
+            time.sleep(0.2)
+
+    threading.Thread(target=sample, daemon=True).start()
+
+    def wrap(name):
+        fn = getattr(pipeline, name)
+
+        def wrapped(*a, **k):
+            peak[0] = rss_gib()
+            torch.xpu.reset_peak_memory_stats()
+            t0 = time.time()
+            result = fn(*a, **k)
+            if name == "sample_sparse_structure":
+                pipeline.image_cond_model = None
+            for model in RELEASE_AFTER.get(name, ()):
+                pipeline.models.pop(model, None)
+            free_ram()
+            print(
+                f"[mem] {name}: {time.time() - t0:.0f}s, RAM peak {peak[0]:.1f} now {rss_gib():.1f} GiB, "
+                f"VRAM peak {torch.xpu.max_memory_allocated() / 2**30:.1f} GiB",
+                flush=True,
+            )
+            return result
+
+        setattr(pipeline, name, wrapped)
+
+    for name in ("get_cond", "sample_sparse_structure", "sample_shape_slat", "sample_shape_slat_cascade",
+                 "sample_tex_slat", "decode_shape_slat", "decode_tex_slat"):
+        wrap(name)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", help="Input image with a transparent background")
@@ -46,16 +109,22 @@ def main():
 
     from trellis2.pipelines.trellis2_image_to_3d import Trellis2ImageTo3DPipeline
 
-    if args.pipeline_type == "512":
-        # The 1024 flow models would only take up RAM.
-        Trellis2ImageTo3DPipeline.model_names_to_load = [
-            n for n in Trellis2ImageTo3DPipeline.model_names_to_load if not n.endswith("_1024")
-        ]
+    # Skip flow models this level never uses: each one costs system RAM.
+    unused = {
+        "512": ("_1024",),
+        "1024": ("_512",),
+        "1024_cascade": ("tex_slat_flow_model_512",),
+        "1536_cascade": ("tex_slat_flow_model_512",),
+    }[args.pipeline_type]
+    Trellis2ImageTo3DPipeline.model_names_to_load = [
+        n for n in Trellis2ImageTo3DPipeline.model_names_to_load if not n.endswith(unused)
+    ]
 
     t0 = time.time()
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
     pipeline.to(torch.device("xpu"))
-    print(f"Loaded in {time.time() - t0:.0f}s on {torch.xpu.get_device_name(0)}")
+    print(f"Loaded in {time.time() - t0:.0f}s on {torch.xpu.get_device_name(0)}, RAM {rss_gib():.1f} GiB")
+    instrument_stages(pipeline)
 
     overrides = {"steps": args.steps} if args.steps else {}
     t0 = time.time()
@@ -97,13 +166,13 @@ def main():
     origin = mesh.origin.cpu().numpy()
     voxel_size = mesh.voxel_size
     del mesh, pipeline
-    gc.collect()
-    torch.xpu.empty_cache()
+    free_ram()
+    print(f"RAM before baking: {rss_gib():.1f} GiB")
 
     t0 = time.time()
     bake_verts, bake_faces = simplify_mesh(verts, faces, args.target_faces)
     del verts, faces
-    gc.collect()
+    free_ram()
     print(f"Simplified to {len(bake_faces):,} triangles in {time.time() - t0:.0f}s")
     normals = trimesh.Trimesh(bake_verts, bake_faces, process=False).vertex_normals
     t0 = time.time()
@@ -115,7 +184,7 @@ def main():
         texture_size=args.texture_size,
     )
     export_glb_with_texture(new_verts, new_faces, uvs, base_color, mr, f"{args.output}.glb", normals=normals[vmapping])
-    print(f"Baked in {time.time() - t0:.0f}s: {args.output}.glb")
+    print(f"Baked in {time.time() - t0:.0f}s: {args.output}.glb, RAM {rss_gib():.1f} GiB")
 
 
 if __name__ == "__main__":
