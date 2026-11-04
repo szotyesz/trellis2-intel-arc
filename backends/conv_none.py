@@ -11,6 +11,10 @@ import torch.nn as nn
 from .. import SparseTensor
 
 
+MAX_ROWS_PER_MATMUL = 1 << 21
+RELEASE_CACHE_ABOVE_ROWS = 1 << 22
+
+
 def sparse_conv3d_init(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, padding=None, bias=True, indice_key=None):
     assert stride == 1 and (padding is None), \
         "Naive implementation only supports submanifold sparse convolution (stride=1, padding=None)"
@@ -83,15 +87,29 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
     V = Kd * Kh * Kw
     w = self.weight.reshape(Co, V, Ci).permute(1, 2, 0)  # (V, Ci, Co)
 
+    # Freed blocks stay reserved by the allocator and fragment, so a later large
+    # tensor can fail with most of the card unused. Give them back first.
+    if feats.device.type == "xpu" and N > RELEASE_CACHE_ABOVE_ROWS:
+        torch.xpu.synchronize()
+        torch.xpu.empty_cache()
+
     # Accumulate in fp32 like FlexGEMM's kernels, even for fp16 inputs.
     out = torch.zeros(N, Co, device=feats.device, dtype=torch.float32)
+    on_xpu = feats.device.type == "xpu"
     for v in range(V):
         slot = neighbor[:, v]
         target = (slot >= 0).nonzero().squeeze(1)
         if target.numel() == 0:
             continue
-        source = feats.index_select(0, slot[target].long())
-        out.index_add_(0, target, (source @ w[v]).float())
+        # Fixed-size chunks keep every allocation small. The matmul on all rows at
+        # once needs a single block of several GiB on large meshes.
+        for chunk in target.split(MAX_ROWS_PER_MATMUL):
+            source = feats.index_select(0, slot[chunk].long())
+            out.index_add_(0, chunk, (source @ w[v]).float())
+            del source
+            # The XPU queue is asynchronous: temporaries stay allocated until it drains.
+            if on_xpu:
+                torch.xpu.synchronize()
 
     if self.bias is not None:
         out = out + self.bias.float()

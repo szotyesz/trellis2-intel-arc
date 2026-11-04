@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 
 # PYTORCH_ENABLE_XPU_FALLBACK stays unset, so a missing op raises an error
 # instead of silently running on the CPU.
@@ -140,7 +141,11 @@ def main():
         )[0]
     except RuntimeError:
         print(FAILURE_HELP, file=sys.stderr)
-        raise
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # A normal exit can hang in the Level Zero runtime after a device error.
+        os._exit(1)
     print(f"Generated in {time.time() - t0:.1f}s, peak VRAM {torch.xpu.max_memory_allocated() / 2**30:.1f} GiB")
 
     verts = mesh.vertices.cpu().numpy()
