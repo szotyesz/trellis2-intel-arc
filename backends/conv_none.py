@@ -11,7 +11,7 @@ import torch.nn as nn
 from .. import SparseTensor
 
 
-MAX_ROWS_PER_MATMUL = 1 << 21
+MAX_CHUNK_BYTES = 1 << 28
 RELEASE_CACHE_ABOVE_ROWS = 1 << 22
 
 
@@ -93,28 +93,33 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
         torch.xpu.synchronize()
         torch.xpu.empty_cache()
 
-    # Accumulate in fp32 like FlexGEMM's kernels, even for fp16 inputs.
-    out = torch.zeros(N, Co, device=feats.device, dtype=torch.float32)
+    # Accumulate each chunk in fp32 like FlexGEMM's kernels, even for fp16 inputs.
+    # Store at the input precision: an fp32 output on an fp16 network costs twice
+    # the memory for the whole tensor.
+    out = torch.empty(N, Co, device=feats.device, dtype=feats.dtype)
     on_xpu = feats.device.type == "xpu"
-    for v in range(V):
-        slot = neighbor[:, v]
-        target = (slot >= 0).nonzero().squeeze(1)
-        if target.numel() == 0:
-            continue
-        # Fixed-size chunks keep every allocation small. The matmul on all rows at
-        # once needs a single block of several GiB on large meshes.
-        for chunk in target.split(MAX_ROWS_PER_MATMUL):
-            source = feats.index_select(0, slot[chunk].long())
-            out.index_add_(0, chunk, (source @ w[v]).float())
-            del source
-            # The XPU queue is asynchronous: temporaries stay allocated until it drains.
-            if on_xpu:
-                torch.xpu.synchronize()
+    bias = self.bias.float() if self.bias is not None else None
+    # Small chunks keep every allocation small. index_add_ needs a temporary the
+    # size of its target on XPU, so it must never run on the full output.
+    chunk_rows = max(1, MAX_CHUNK_BYTES // (4 * max(Co, Ci)))
+    for start in range(0, N, chunk_rows):
+        rows = neighbor[start:start + chunk_rows]
+        acc = torch.zeros(rows.shape[0], Co, device=feats.device, dtype=torch.float32)
+        for v in range(V):
+            slot = rows[:, v]
+            target = (slot >= 0).nonzero().squeeze(1)
+            if target.numel() > 0:
+                source = feats.index_select(0, slot[target].long())
+                acc.index_add_(0, target, (source @ w[v]).float())
+        if bias is not None:
+            acc += bias
+        out[start:start + rows.shape[0]] = acc.to(feats.dtype)
+        del acc
+        # The XPU queue is asynchronous: temporaries stay allocated until it drains.
+        if on_xpu:
+            torch.xpu.synchronize()
 
-    if self.bias is not None:
-        out = out + self.bias.float()
-
-    return x.replace(out.to(feats.dtype))
+    return x.replace(out)
 
 
 def sparse_inverse_conv3d_init(self, *args, **kwargs):

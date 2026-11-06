@@ -146,3 +146,35 @@ def test_unweld_keeps_geometry_and_removes_non_manifold_edges():
     np.testing.assert_array_equal(nv[nf], v[f])
     edges = np.sort(np.concatenate([nf[:, [0, 1]], nf[:, [1, 2]], nf[:, [2, 0]]]), axis=1)
     assert np.unique(edges, axis=0, return_counts=True)[1].max() <= 2
+
+
+def test_sparse_conv_matches_flexgemm_layout():
+    """Slot order and direction follow FlexGEMM's _compute_neighbor_cache_torch."""
+    from trellis2.modules.sparse import SparseTensor
+    from trellis2.modules.sparse.conv.conv_none import sparse_conv3d_forward
+
+    torch.manual_seed(0)
+    Co, K, Ci = 3, 3, 2
+    coords = torch.unique(torch.randint(0, 6, (120, 3)), dim=0)
+    coords = torch.cat([torch.zeros(len(coords), 1, dtype=coords.dtype), coords], dim=1).int()
+    feats = torch.randn(len(coords), Ci)
+
+    class Conv:
+        weight = torch.randn(Co, K, K, K, Ci)
+        bias = torch.randn(Co)
+        dilation = (1, 2, 1)
+
+    index = {tuple(c): i for i, c in enumerate(coords[:, 1:].tolist())}
+    expected = torch.zeros(len(coords), Co)
+    for i, (a, b, c) in enumerate(coords[:, 1:].tolist()):
+        for ka in range(K):
+            for kb in range(K):
+                for kc in range(K):
+                    n = index.get((a + (ka - 1) * 1, b + (kb - 1) * 2, c + (kc - 1) * 1))
+                    if n is not None:
+                        expected[i] += Conv.weight[:, ka, kb, kc] @ feats[n]
+    expected += Conv.bias
+
+    x = SparseTensor(feats=feats, coords=coords)
+    out = sparse_conv3d_forward(Conv, x).feats
+    assert torch.allclose(out, expected, atol=1e-5)

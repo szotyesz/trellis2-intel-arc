@@ -273,7 +273,7 @@ volumes:
 | `torch.xpu` does not initialise | Try `ubuntu:26.04`, which Intel validated for this release, with its archive `libze1` 1.28.2. Then try the older Kobuk PPA stack (compute-runtime 26.05) |
 | SDPA peak memory is flat as L grows | Skip the chunked attention in Phase 5 |
 | SDPA peak memory grows as L² | Chunked attention becomes required before any complex 512 asset |
-| bf16 gives NaNs or wrong results | Convert flow models with `convert_to`. Try fp16, then fp32 (about 4.8 GiB of weights, and oneDNN uses its slower non-systolic kernel) |
+| bf16 gives NaNs or wrong results | Convert flow models with `convert_to`. Try fp16. Do not use fp32: the probe showed fused SDPA builds an L×L tensor and runs out of memory at L=32768 |
 
 ## Phase 2: First geometry at 512
 
