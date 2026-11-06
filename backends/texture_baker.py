@@ -76,27 +76,155 @@ def orient_faces(vertices, faces):
     return out
 
 
-def unweld_non_manifold(vertices, faces):
-    """Give faces on edges shared by 3+ faces private vertices. Removes no geometry.
+def split_non_manifold_vertices(vertices, faces, pair_sheets=True):
+    """Split vertices so that edges shared by three or more faces come apart.
 
-    The extractor produces many such edges. They stall the simplifier and make
-    xatlas take hours.
+    The extractor and vertex clustering both produce such edges, which stall
+    the simplifier and make xatlas take hours. The faces around each vertex
+    are grouped into fans that connect through manifold edges, and each fan
+    gets its own copy of the vertex.
+
+    With `pair_sheets`, an edge shared by three or four faces keeps joined
+    the two faces that continue through it most directly: the pair whose far
+    vertices lie in the most opposite directions across the edge. So a
+    T-junction cuts off only the sheet that ends there, and two walls that
+    merged into one edge separate into two intact sheets. The test is purely
+    geometric, so it does not depend on face winding, which is unreliable on
+    these meshes. Without pairing every such edge becomes a cut, which
+    fragments the mesh into many small pieces, and xatlas into many small
+    charts. Edges shared by five or more faces, and anything pairing leaves
+    non-manifold, are always cut.
     """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    faces = np.asarray(faces)
+    F = len(faces)
+    # Edge slot c * F + i runs from corner c to corner (c + 1) % 3 of face i.
     edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
     keys = edges.min(axis=1) * (int(faces.max()) + 1) + edges.max(axis=1)
+    order = np.argsort(keys, kind="stable")
+    k = keys[order]
+    run_start = np.r_[True, k[1:] != k[:-1]]
+    run_first = np.flatnonzero(run_start)
+    counts = np.diff(np.r_[run_first, len(k)])
+    two = run_first[counts == 2]
+    ea, eb = order[two], order[two + 1]
+    if pair_sheets:
+        v = np.asarray(vertices, dtype=np.float64)
+        # For each edge slot: unit direction from the edge to the face's far
+        # vertex, perpendicular to the edge.
+        slot = np.arange(3 * F)
+        far = faces[slot % F, (slot // F + 2) % 3]
+        axis = v[edges[:, 1]] - v[edges[:, 0]]
+        axis /= np.linalg.norm(axis, axis=1, keepdims=True) + 1e-30
+        side = v[far] - v[edges[:, 0]]
+        side -= (side * axis).sum(axis=1, keepdims=True) * axis
+        side /= np.linalg.norm(side, axis=1, keepdims=True) + 1e-30
+
+        def agreement(slots, i, j):
+            return -(side[slots[:, i]] * side[slots[:, j]]).sum(axis=1)
+
+        three = run_first[counts == 3]
+        if len(three):
+            slots = np.stack([order[three + i] for i in range(3)], axis=1)
+            best = np.argmax(np.stack([agreement(slots, 0, 1), agreement(slots, 0, 2), agreement(slots, 1, 2)], axis=1), axis=1)
+            i, j = np.array([0, 0, 1])[best], np.array([1, 2, 2])[best]
+            rows = np.arange(len(slots))
+            ea, eb = np.r_[ea, slots[rows, i]], np.r_[eb, slots[rows, j]]
+        four = run_first[counts == 4]
+        if len(four):
+            slots = np.stack([order[four + i] for i in range(4)], axis=1)
+            pairings = np.array([[[0, 1], [2, 3]], [[0, 2], [1, 3]], [[0, 3], [1, 2]]])
+            scores = np.stack([agreement(slots, a[0], a[1]) + agreement(slots, b[0], b[1]) for a, b in pairings], axis=1)
+            chosen = pairings[np.argmax(scores, axis=1)]            # [M, 2, 2]
+            rows = np.arange(len(slots))[:, None]
+            ea, eb = np.r_[ea, slots[rows, chosen[:, :, 0]].ravel()], np.r_[eb, slots[rows, chosen[:, :, 1]].ravel()]
+    fa, ca = ea % F, ea // F
+    fb, cb = eb % F, eb // F
+    # Corner node 3 * i + c. Across a manifold edge, join the corners that
+    # hold the same vertex; the two faces may traverse the edge either way.
+    same = edges[ea, 0] == edges[eb, 0]
+    a0, a1 = 3 * fa + ca, 3 * fa + (ca + 1) % 3
+    b0, b1 = 3 * fb + cb, 3 * fb + (cb + 1) % 3
+    rows = np.r_[a0, a1]
+    cols = np.r_[np.where(same, b0, b1), np.where(same, b1, b0)]
+    graph = coo_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)), shape=(3 * F, 3 * F))
+    _, fan = connected_components(graph, directed=False)
+    _, fan_first = np.unique(fan, return_index=True)
+    return np.asarray(vertices)[faces.reshape(-1)[fan_first]], fan.reshape(F, 3)
+
+
+def make_edge_manifold(vertices, faces, pair_sheets=False):
+    """Make every edge manifold and the winding consistent.
+
+    Cutting alone is the default. Pairing first gives a better-connected
+    mesh with about a third fewer UV charts, but xatlas then takes 6 to 11
+    minutes per asset instead of under a minute on the meshes measured.
+    """
+    v, f = vertices, faces
+    if pair_sheets:
+        v, f = split_non_manifold_vertices(v, f, pair_sheets=True)
+    v, f = split_non_manifold_vertices(v, f, pair_sheets=False)
+    return v, orient_faces(v, f)
+
+
+def cluster_vertices(vertices, faces, cell):
+    """Merge vertices that fall in the same cube of side `cell`.
+
+    A fast, memory-light first pass for meshes too large for quadric
+    simplification. Faces that collapse to a line or point are dropped, as are
+    duplicate faces.
+    """
+    v = np.asarray(vertices, dtype=np.float64)
+    cells = np.floor((v - v.min(axis=0)) / cell).astype(np.int64)
+    extent = cells.max(axis=0) + 1
+    keys = (cells[:, 0] * extent[1] + cells[:, 1]) * extent[2] + cells[:, 2]
     _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
-    bad = (counts[inverse] > 2).reshape(3, -1).any(axis=0)
-    out = faces.copy()
-    out[bad] = len(vertices) + np.arange(3 * int(bad.sum())).reshape(-1, 3)
-    return np.vstack([vertices, vertices[faces[bad]].reshape(-1, 3)]), out
+    inverse = inverse.ravel()
+    merged = np.stack([np.bincount(inverse, weights=v[:, axis]) for axis in range(3)], axis=1) / counts[:, None]
+    f = inverse[np.asarray(faces)]
+    f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
+    f = f[np.unique(np.sort(f, axis=1), axis=0, return_index=True)[1]]
+    return merged, f
 
 
-def simplify_mesh(vertices, faces, target):
-    """Repair, then decimate to about `target` faces."""
+def _mean_edge_length(vertices, faces):
+    return float(np.linalg.norm(vertices[faces[:, 1]] - vertices[faces[:, 0]], axis=1).mean())
+
+
+def clean_faces(vertices, faces):
+    """Drop faces with a repeated vertex, zero area, or a duplicate triangle.
+
+    The simplifier leaves a few thousand of these on large meshes, and xatlas
+    does not cope well with them.
+    """
+    f = np.asarray(faces)
+    keep = (f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])
+    tri = np.asarray(vertices)[f]
+    keep &= np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1) > 1e-14
+    f = f[keep]
+    return f[np.sort(np.unique(np.sort(f, axis=1), axis=0, return_index=True)[1])]
+
+
+def simplify_mesh(vertices, faces, target, voxel_size=None, max_raw_faces=8_000_000, pair_sheets=False):
+    """Repair, then decimate to about `target` faces.
+
+    Meshes above `max_raw_faces` get a vertex-clustering pass first: the repair
+    steps and the quadric simplifier would otherwise need tens of GiB of RAM
+    and many minutes. Triangle count on a surface scales with 1 / cell^2.
+    """
     import fast_simplification
 
     v = np.asarray(vertices, dtype=np.float64)
-    v, f = unweld_non_manifold(v, orient_faces(v, faces))
+    f = np.asarray(faces)
+    if len(f) > max_raw_faces:
+        # Cells of two voxels merge the two sides of one-voxel walls into one
+        # sheet, which the repair below handles well. Three-voxel cells merge
+        # far more and left a 57M-triangle mesh fragmented, so stop at two.
+        base = voxel_size if voxel_size else _mean_edge_length(v, f)
+        v, f = cluster_vertices(v, f, base * min(2.0, np.ceil(np.sqrt(len(f) / max_raw_faces))))
+    v, f = make_edge_manifold(v, orient_faces(v, f), pair_sheets)
     # One call can stop early, so repeat until it reaches the target or stalls.
     for _ in range(6):
         if len(f) <= target * 1.05:
@@ -105,7 +233,16 @@ def simplify_mesh(vertices, faces, target):
         v, f = fast_simplification.simplify(v, f, 1.0 - target / len(f))
         if len(f) > before * 0.98:
             break
-    return v, orient_faces(v, f)
+    if len(f) > target * 1.3:
+        # The simplifier keeps boundary edges, so it can stall on meshes with
+        # many of them. Cluster the rest of the way.
+        v, f = cluster_vertices(v, f, _mean_edge_length(v, f) * np.sqrt(len(f) / target))
+        if len(f) > target * 1.05:
+            v, f = fast_simplification.simplify(v, f, 1.0 - target / len(f))
+    # Simplification creates new non-manifold edges, and xatlas can take tens
+    # of minutes on them. Clean, orient, then repair again before unwrapping.
+    f = clean_faces(v, f)
+    return make_edge_manifold(v, orient_faces(v, f), pair_sheets)
 
 
 def uv_unwrap(vertices, faces):
@@ -235,19 +372,47 @@ def sample_sparse_trilinear(coords, attrs, query):
     return out, valid
 
 
+def sample_nearest_voxel(coords, attrs, query, max_distance):
+    """Attributes of the nearest active voxel within `max_distance` voxels.
+
+    Returns [M, C] values and [M] bool, False where no voxel is that close.
+    """
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(np.asarray(coords, dtype=np.float64) + 0.5)
+    distance, index = tree.query(query, distance_upper_bound=max_distance)
+    found = np.isfinite(distance)
+    out = np.zeros((len(query), attrs.shape[1]), dtype=np.float32)
+    out[found] = attrs[index[found]]
+    return out, found
+
+
+# Simplification moves the surface off the voxel shell, by more at high
+# resolutions. Texels that miss it take the nearest voxel within this radius.
+NEAREST_VOXEL_RADIUS = 3.0
+
+
 def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_size, texture_size=2048):
     """Bake voxel attributes into textures.
 
     Attribute layout: base colour 0:3, metallic 3, roughness 4, alpha 5.
     Returns the RGB base colour image, the glTF metallic-roughness image, and
-    the share of covered texels that had a voxel to sample.
+    the share of covered texels that had a voxel to sample trilinearly.
     """
     t0 = time.time()
     positions, mask = _rasterize_uv_triangles(vertices, faces, uvs, texture_size)
     query = (positions[mask] - np.asarray(origin)) / voxel_size
-    sampled, valid = sample_sparse_trilinear(voxel_coords, np.asarray(voxel_attrs), query)
+    voxel_attrs = np.asarray(voxel_attrs)
+    sampled, valid = sample_sparse_trilinear(voxel_coords, voxel_attrs, query)
     hit_rate = float(valid.mean()) if len(valid) else 0.0
-    print(f"  Texels: {len(valid):,}, with voxel data: {hit_rate:.2%}, {time.time() - t0:.1f}s")
+    missed = np.flatnonzero(~valid)
+    if len(missed):
+        near, found = sample_nearest_voxel(voxel_coords, voxel_attrs, query[missed], NEAREST_VOXEL_RADIUS)
+        sampled[missed[found]] = near[found]
+        valid = valid.copy()
+        valid[missed[found]] = True
+    print(f"  Texels: {len(valid):,}, trilinear hits {hit_rate:.2%}, "
+          f"with nearest voxel {float(valid.mean()) if len(valid) else 0.0:.2%}, {time.time() - t0:.1f}s")
 
     filled = np.zeros_like(mask)
     filled[mask] = valid

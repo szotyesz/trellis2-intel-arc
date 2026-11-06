@@ -105,6 +105,9 @@ def main():
     parser.add_argument("--no-texture", action="store_true", help="Export the raw mesh as OBJ only")
     parser.add_argument("--save-raw", action="store_true", help="Also write the raw mesh as OBJ (hundreds of MB)")
     parser.add_argument("--target-faces", type=int, default=200000, help="Triangles in the final GLB")
+    parser.add_argument("--repair", default="cut", choices=["cut", "pair"],
+                        help="Non-manifold edge repair: 'pair' keeps sheets connected and makes fewer UV charts, "
+                             "but UV unwrapping then takes 6-11 minutes instead of under one")
     parser.add_argument("--steps", type=int, default=None, help="Override sampler steps for all phases")
     args = parser.parse_args()
 
@@ -175,7 +178,8 @@ def main():
     print(f"RAM before baking: {rss_gib():.1f} GiB")
 
     t0 = time.time()
-    bake_verts, bake_faces = simplify_mesh(verts, faces, args.target_faces)
+    bake_verts, bake_faces = simplify_mesh(verts, faces, args.target_faces, voxel_size=voxel_size,
+                                           pair_sheets=args.repair == "pair")
     del verts, faces
     free_ram()
     print(f"Simplified to {len(bake_faces):,} triangles in {time.time() - t0:.0f}s")

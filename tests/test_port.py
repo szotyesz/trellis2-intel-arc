@@ -136,16 +136,76 @@ def test_orient_faces_repairs_flipped_cube():
     assert trimesh.Trimesh(box.vertices, fixed, process=False).volume > 0
 
 
-def test_unweld_keeps_geometry_and_removes_non_manifold_edges():
+def _edge_counts(f):
+    edges = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
+    return np.unique(edges, axis=0, return_counts=True)[1]
+
+
+def test_split_separates_merged_sheets_but_keeps_them_connected():
     baker = load_baker()
-    # Three triangles sharing the edge 0-1.
-    v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1]], dtype=np.float64)
-    f = np.array([[0, 1, 2], [1, 0, 3], [0, 1, 4]])
-    nv, nf = baker.unweld_non_manifold(v, f)
-    assert len(nf) == 3
-    np.testing.assert_array_equal(nv[nf], v[f])
-    edges = np.sort(np.concatenate([nf[:, [0, 1]], nf[:, [1, 2]], nf[:, [2, 0]]]), axis=1)
+    # Two sheets, each a closed ring of four triangles around vertex 1, merged
+    # along the edge 1-2, which four faces share. Sheet 1 lies in the plane
+    # z = 0 and sheet 2 in y = 0, so each sheet continues straight through
+    # the merged edge and pairing keeps its two faces there together.
+    v = np.array([[0, -1, 0], [1, 0, 0], [2, 0, 0], [2, 1, 0], [0, 1, 0], [2, 0, 1], [0, 0, 1], [0, 0, -1]], dtype=np.float64)
+    f = np.array([[1, 0, 2], [1, 2, 3], [1, 3, 4], [1, 4, 0],      # sheet 1
+                  [1, 2, 5], [1, 5, 6], [1, 6, 7], [1, 7, 2]])     # sheet 2
+    nv, nf = baker.split_non_manifold_vertices(v, f, pair_sheets=True)
+    np.testing.assert_array_equal(nv[nf], v[f])      # geometry unchanged
+    assert _edge_counts(nf).max() == 2
+    assert len(set(nf[:4, 0])) == 1 and len(set(nf[4:, 0])) == 1
+    assert len(nv) == 10                             # vertices 1 and 2 each split in two
+    assert not set(nf[:4].ravel()) & set(nf[4:].ravel())
+    assert len(set(nf[0]) & set(nf[1])) == 2         # sheet 1 still shares the edge
+    assert len(set(nf[4]) & set(nf[7])) == 2         # and so does sheet 2
+
+    # Cutting only: vertex 2 reaches the other faces only through the merged
+    # edge, so it splits four ways.
+    nv, nf = baker.split_non_manifold_vertices(v, f, pair_sheets=False)
+    assert len(nv) == 12
+    assert _edge_counts(nf).max() == 2
+
+
+def test_split_keeps_a_manifold_mesh_unchanged():
+    baker = load_baker()
+    sphere = trimesh.creation.icosphere(subdivisions=2)
+    nv, nf = baker.split_non_manifold_vertices(np.array(sphere.vertices), np.array(sphere.faces))
+    assert len(nv) == len(sphere.vertices)
+    assert trimesh.Trimesh(nv, nf, process=False).is_watertight
+
+
+def test_cluster_vertices_merges_cells_and_drops_degenerate_faces():
+    baker = load_baker()
+    sphere = trimesh.creation.icosphere(subdivisions=4)   # 5,120 faces
+    v, f = baker.cluster_vertices(np.array(sphere.vertices), np.array(sphere.faces), cell=0.2)
+    assert 0 < len(f) < len(sphere.faces) / 4
+    assert (f[:, 0] != f[:, 1]).all() and (f[:, 1] != f[:, 2]).all() and (f[:, 0] != f[:, 2]).all()
+    assert len(np.unique(np.sort(f, axis=1), axis=0)) == len(f)
+    assert np.allclose(v.min(axis=0), sphere.vertices.min(axis=0), atol=0.2)
+    assert np.allclose(v.max(axis=0), sphere.vertices.max(axis=0), atol=0.2)
+
+
+def test_simplify_mesh_reaches_target_through_clustering_pass():
+    baker = load_baker()
+    sphere = trimesh.creation.icosphere(subdivisions=5)   # 20,480 faces
+    v, f = baker.simplify_mesh(np.array(sphere.vertices), np.array(sphere.faces), 500, max_raw_faces=5000)
+    assert len(f) <= 650
+    out = trimesh.Trimesh(v, f, process=False)
+    assert abs(out.volume - sphere.volume) < 0.25 * sphere.volume
+    edges = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
     assert np.unique(edges, axis=0, return_counts=True)[1].max() <= 2
+
+
+def test_nearest_voxel_fills_texels_off_the_shell():
+    baker = load_baker()
+    coords = np.array([[5, 5, 5], [9, 5, 5]])
+    attrs = np.array([[1.0, 0, 0, 0, 0, 1], [0, 0, 1.0, 0, 0, 1]], dtype=np.float32)
+    query = np.array([[5.5, 5.5, 5.5], [7.2, 5.5, 5.5], [20.0, 20.0, 20.0]])
+    sampled, valid = baker.sample_sparse_trilinear(coords, attrs, query)
+    assert valid.tolist() == [True, False, False]
+    near, found = baker.sample_nearest_voxel(coords, attrs, query, max_distance=3.0)
+    assert found.tolist() == [True, True, False]
+    assert near[1, 0] == 1.0          # closer to the red voxel at 5 than the blue one at 9
 
 
 def test_sparse_conv_matches_flexgemm_layout():
