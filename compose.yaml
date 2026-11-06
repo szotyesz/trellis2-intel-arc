@@ -18,6 +18,7 @@ services:
       ONEAPI_DEVICE_SELECTOR: level_zero:gpu
       SYCL_CACHE_PERSISTENT: "1"
       SYCL_CACHE_DIR: /cache/sycl
+      TRITON_CACHE_DIR: /cache/triton
     volumes: ["trellis-cache:/cache", "./input:/input:ro", "./out:/out"]
   fetch-weights:            # network and token, no GPU
     image: trellis-xpu:dev

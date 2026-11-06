@@ -1,14 +1,17 @@
 FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git ocl-icd-libopencl1 && rm -rf /var/lib/apt/lists/*
+# gcc and g++: Triton builds a small host launcher per kernel at run time.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git ocl-icd-libopencl1 gcc g++ && rm -rf /var/lib/apt/lists/*
 
-# GPU user space only, same versions as the host. No oneAPI toolkit in this image.
+# GPU user space only, same versions as the host. No oneAPI toolkit in this
+# image: Triton gets its SYCL headers from the intel-sycl-rt wheel and the
+# Level Zero headers from libze-dev.
 RUN set -eux; mkdir /tmp/gpu; cd /tmp/gpu; \
     CR=https://github.com/intel/compute-runtime/releases/download/26.35.39758.10; \
     IGC=https://github.com/intel/intel-graphics-compiler/releases/download/v2.41.5; \
     LZ=https://github.com/oneapi-src/level-zero/releases/download/v1.32.0; \
-    for u in $CR/intel-opencl-icd_26.35.39758.10-0_amd64.deb $CR/libze-intel-gpu1_26.35.39758.10-0_amd64.deb $CR/intel-ocloc_26.35.39758.10-0_amd64.deb $CR/libigdgmm12_22.10.0_amd64.deb "$IGC/intel-igc-core-2_2.41.5+22716_amd64.deb" "$IGC/intel-igc-opencl-2_2.41.5+22716_amd64.deb" "$LZ/libze1_1.32.0+u24.04_amd64.deb"; do curl -fsSLO --retry 3 "$u"; done; \
+    for u in $CR/intel-opencl-icd_26.35.39758.10-0_amd64.deb $CR/libze-intel-gpu1_26.35.39758.10-0_amd64.deb $CR/intel-ocloc_26.35.39758.10-0_amd64.deb $CR/libigdgmm12_22.10.0_amd64.deb "$IGC/intel-igc-core-2_2.41.5+22716_amd64.deb" "$IGC/intel-igc-opencl-2_2.41.5+22716_amd64.deb" "$LZ/libze1_1.32.0+u24.04_amd64.deb" "$LZ/libze-dev_1.32.0+u24.04_amd64.deb"; do curl -fsSLO --retry 3 "$u"; done; \
     printf '%s\n' \
       '61712caaddeba3d38e4f79e2a0fb23fea25596ca2d72c3144c6eea2331ec4301  intel-opencl-icd_26.35.39758.10-0_amd64.deb' \
       'c19a641b953d55aebbf1d51bec364a84bf629f985e02fbbe6dc70224c0e88470  libze-intel-gpu1_26.35.39758.10-0_amd64.deb' \
@@ -16,8 +19,11 @@ RUN set -eux; mkdir /tmp/gpu; cd /tmp/gpu; \
       '6031a63d6e8a12ce61c14efc15f2c8e727061286e3820b8594e6d00615e04d54  libigdgmm12_22.10.0_amd64.deb' \
       '0a6e64a663ae65a0fa02d6912ae3b6b37cf85b90c21cc423fd9fef70aaf4f628  intel-igc-core-2_2.41.5+22716_amd64.deb' \
       '779e1b9e88098eb25711e9a8f67c2752665bad22f134aa40ed5649f6e1b87058  intel-igc-opencl-2_2.41.5+22716_amd64.deb' \
-      '3c846af24f84a89150f6a4c6adcb4ea4ebef74dc119fe44f4e269bfaa72c7ba6  libze1_1.32.0+u24.04_amd64.deb' | sha256sum -c -; \
+      '3c846af24f84a89150f6a4c6adcb4ea4ebef74dc119fe44f4e269bfaa72c7ba6  libze1_1.32.0+u24.04_amd64.deb' \
+      '4b783ed5fb937a55a7a0f3a8bc66af252f362e82476ebc0304da36173c9f2eb8  libze-dev_1.32.0+u24.04_amd64.deb' | sha256sum -c -; \
     apt-get update; apt-get install -y --no-install-recommends ./*.deb; rm -rf /tmp/gpu /var/lib/apt/lists/*
+# Where Triton's Intel backend looks for Level Zero headers and the loader.
+ENV ZE_PATH=/usr
 
 # Python environment from the hash lock.
 ENV UV_PYTHON_INSTALL_DIR=/opt/python

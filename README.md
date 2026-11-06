@@ -43,8 +43,9 @@ A run can use nearly all of the card's memory, so stop anything else that is usi
 |---|---|---|
 | `--pipeline-type` | `512` | `512`, `1024`, `1024_cascade` or `1536_cascade` |
 | `--seed` | `42` | Random seed. Results still vary slightly between runs |
-| `--target-faces` | `200000` | Triangles in the GLB. Thin objects and scenes can overshoot |
+| `--target-faces` | `200000` | Triangles in the GLB |
 | `--texture-size` | `1024` | `512`, `1024`, `2048` or `4096` |
+| `--repair` | `cut` | How non-manifold edges are repaired before baking. `pair` keeps surfaces better connected and makes about a third fewer UV charts, but UV unwrapping then takes 6–11 minutes instead of under one |
 | `--max-tokens` | `49152` | Upper limit on sparse tokens in cascade pipelines |
 | `--steps` | model default | Sampler steps for all phases |
 | `--no-texture` | off | Write only the raw mesh as OBJ |
@@ -52,11 +53,12 @@ A run can use nearly all of the card's memory, so stop anything else that is usi
 
 ## Choosing a pipeline type
 
-Start with `1024_cascade` for solid objects, and use `512` when it runs out of GPU memory. Measurements and known failures are in [docs/xpu-measurements.md](docs/xpu-measurements.md).
+`1024_cascade` is the best balance for solid objects, at about 5 minutes per image. `512` takes about 2 minutes and is the fallback for anything that fails. `1536_cascade` takes 2–3 times longer than `1024_cascade` and shows little extra detail once baked to 200,000 triangles. Measurements are in [docs/xpu-measurements.md](docs/xpu-measurements.md).
 
 ## Limitations
 
-- **GPU memory:** `512` has completed every input tested. Higher levels can still run out of memory while decoding, especially on scenes and transparent objects. A failed run exits with an error.
+- **GPU memory:** every input retested after the convolution fixes completes at every level, with peak VRAM up to about 19 GiB at `1536_cascade`. A run that does run out exits with an error rather than hanging.
+- **First run:** Triton compiles the convolution kernel on first use, about 10 s once per cache volume.
 - **Fine parts:** thin structures can break up or become floating specks.
 - **Colour:** output is often darker or less saturated than the input. The cause has not been fully traced; see the measurements.
 - **Transparency:** glass comes out as an opaque shell.
@@ -66,10 +68,10 @@ Start with `1024_cascade` for solid objects, and use `512` when it runs out of G
 
 | Upstream needs | Here |
 |---|---|
-| CUDA sparse convolution (FlexGEMM) | `backends/conv_none.py`, plain PyTorch |
+| CUDA sparse convolution (FlexGEMM) | `backends/conv_none.py`: a Triton gather-matmul kernel on XPU, a plain PyTorch loop on CPU and as fallback |
 | CUDA mesh extraction (`o_voxel`) | `backends/mesh_extract.py`, plain PyTorch |
 | `nvdiffrast` texture baking | `backends/texture_baker.py`, NumPy and xatlas on the CPU |
-| CuMesh repair and simplification | `orient_faces`, `unweld_non_manifold` and `fast_simplification` |
+| CuMesh repair and simplification | `backends/texture_baker.py`: vertex clustering for huge meshes, winding repair, non-manifold vertex splitting, `fast_simplification` |
 | RMBG-2.0 background removal | Removed, because of its non-commercial licence |
 
 `patches/xpu_compat.py` patches upstream at image build time and fails the build if an expected line is missing. CPU fallback stays disabled, so a missing XPU operator raises an error rather than silently running slowly. GPU containers run with no network.

@@ -79,3 +79,41 @@ Output is often darker or less saturated than the input, and differs between lev
 - **XPU sampling is not the cause.** From identical inputs and noise at 512, XPU and CPU texture latents differ by a mean of 0.0064 against a latent standard deviation of 2.66 (0.24%).
 - **Not yet tested:** decoder output on XPU against CPU (the CPU decode ran out of RAM in the test container), `conv_none` against upstream's FlexGEMM, and DINOv3 features on XPU against CPU.
 - **Possibly expected:** the model predicts PBR base colour, which removes lighting, so some darkening may be normal. A reference run of upstream on CUDA would settle this.
+
+## Update, 2026-11-06
+
+### GPU memory, final state
+
+With the convolution chunked by bytes and stored at the input precision, every benchmark failure that was retested completed its GPU phase, including every `1536_cascade` case, at 13–19 GiB peak VRAM. Three of those runs then failed on the CPU: two timed out in UV unwrapping after more than 35 minutes and one exceeded the container's RAM cap while baking a 46M-triangle mesh. Those are the baking problems below.
+
+### Baking large meshes
+
+Measured on saved raw meshes: the machine at `1024_cascade` (12.2M triangles) and the bear at `1536_cascade` (26.1M).
+
+| Step | Before | After |
+|---|---|---|
+| Repair of non-manifold edges | Faces on them got private vertices, which the simplifier never removes: 62% of final faces were isolated triangles on the 12M mesh | Vertices split into fans connected through manifold edges: 1–3% isolated |
+| Meshes over 8M triangles | Repair and simplification needed over 26 GiB on 46M triangles | Vertex clustering at 2 voxels first: 12M → 2.7M in 7 s, then everything is small |
+| Simplify 12.2M → 200K | 37 s, 6.1 GB peak RAM | 9 s, 1.9 GB |
+| Simplify 26.1M → 200K | Not attempted before | 17 s |
+| Unwrap, 12.2M input | 247 s | 16–25 s |
+| Unwrap, 26.1M input | Over 35 min, killed | 196–214 s |
+| Texels with voxel data at 1536 | 70–89% trilinear | 97–99.7% after a nearest-voxel fallback within 3 voxels |
+
+Full runs after the change: farmer at `1536_cascade` (57M triangles, previously killed at 26 GiB) baked in 32 s with 6 GB; bear at `1536_cascade` in 227 s; interior at `1024` in 42 s (previously over 50 minutes).
+
+Clustering at 3 voxels, which the 57M mesh got, left it fragmented into 91K pieces. The factor is now capped at 2. The farmer at that level has not been rerun since; the repeated benchmark will show it.
+
+### Pairing sheets at non-manifold edges
+
+An alternative repair pairs the two faces that continue straight through a non-manifold edge instead of cutting all of them apart. On the 512 machine mesh it gives 121K vertices for 200K faces instead of 203K, 51K boundary edges instead of 137K, and 24K UV charts instead of 38K, but xatlas takes 686 s instead of 24 s; 359 s against 25 s on the 1024 mesh. It is available as `--repair pair` and off by default. Its visual benefit has not been checked.
+
+### Triton sparse convolution
+
+One Triton kernel gathers the neighbour rows of each output row and multiplies them in one pass, fp32 accumulation. Triton's JIT needs `g++` and the Level Zero headers in the image; the SYCL headers come from the `intel-sycl-rt` wheel.
+
+- Kernel alone, 400K rows, 64 channels, fp16: 3.1 ms against 265.7 ms for the loop.
+- Per-call profile of a `1024_cascade` run (`TRELLIS_CONV_PROFILE=1`): the loop spends 13 s in convolution. The first Triton version spent 44 s, because `@triton.autotune` and compile-time channel counts cost about 4.5 s per distinct layer shape, and there are eighteen. With one fixed configuration and runtime channel counts, the kernel is compiled once and served from the cache: convolution time 5 s, generation 115 s against 121 s, both decodes 3 s against 7 s, peak VRAM 7.7 GiB against 6.8 GiB for the chunked loop.
+- Inputs under 16K rows use the loop: 2,048 rows at 1024 channels took 0.5 s per call in Triton and 0.04 s looped.
+
+So the gain is in decoding, not in generation time, which the flow transformers dominate. The earlier 9–12 GiB peaks at `1024_cascade` came from the loop's temporaries, which the chunking had already removed.

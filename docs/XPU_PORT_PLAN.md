@@ -376,6 +376,8 @@ Match upstream's behaviour in each row, but write the code here. Do not import u
 
 Use the Phase 5 stage profile. Do not start any of these from intuition.
 
+**Status, 2026-11-06.** 6A was done differently from the plan below: not by porting FlexGEMM, but with one Triton gather-matmul kernel inside `conv_none.py` (see `docs/xpu-measurements.md`). It did not meet the 2× gate on generation time, because the flow transformers dominate and the loop was already chunked; it was kept because decoding runs about twice as fast and needs no per-slot temporaries. Its cost is `g++` and `libze-dev` in the image. 6B and 6C were not needed. 6D remains open. 6E still awaits the owner's decision.
+
 **A. FlexGEMM Triton kernels (MIT).** Consider this only if decoders exceed 25% of end-to-end time at the target resolution. Timebox it to one day. Required changes, from reading the source:
 
 - `kernels/__init__.py` imports the compiled `cuda` module unconditionally. Add a backend switch, as mtlgemm did with `FLEX_GEMM_BACKEND`.
