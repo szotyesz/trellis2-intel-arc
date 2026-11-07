@@ -181,3 +181,18 @@ Scored on the 12 example images, each composited over white, grey, gradient and 
 Picking the mask by SAM 2's own score chooses a part of the object (pineapple 0.00, machine 0.03 with a centre point); the largest of its three masks is the whole object. SAM 3's mask decoder crashed the XPU `group_norm` kernel with a segmentation fault; a group norm written in plain tensor operations avoids it. SAM 3 takes about 2 s per image on the B60 and 42 s on the CPU; SAM 2 under a second.
 
 `transformers` moved from 4.57.6 to 5.22.2 for SAM 3. A `512` generation on the new image produced 1.53M raw triangles for the pineapple against 1.55M before, within the run-to-run variation, and the unit tests pass.
+
+### Spikes from an int32 overflow in the mesh repair
+
+The first benchmark with `--repair pair` as the default (7 November, all 48 main runs successful) produced straw-like triangles spanning the whole model on the stroller and the farmer at `1536_cascade`, and both overshot the triangle target (228,887 and 213,375 faces). Measured as the share of edges longer than 20 times the median edge, the stroller went from 0.12% in the 6 November run to 1.90%, the farmer from 0.04% to 0.47%.
+
+The cause is an integer overflow, present since the repair was written. `orient_faces` and `split_non_manifold_vertices` key each edge as `min(a, b) * (n_vertices + 1) + max(a, b)`. SciPy's component labels and the simplifier's faces are int32, so on any mesh with more than 46,341 vertices the product wraps around and unrelated edges share a key. Those edges are then treated as one non-manifold edge: cut mode splits vertices that needed no split, and pair mode can join corners of different vertices into one, which stretches a triangle across the model. In cut mode only the final repair after decimation ran on int32 faces; in pair mode the second split always received int32 labels from the first, which is why the damage grew with the pairing default and with mesh size. All index arrays are now int64, and a test runs the repair on a 163,842-vertex sphere with int32 faces.
+
+Same raw mesh, before and after the fix, long edges after the final repair:
+
+| Mesh | cut, before → after | pair, before → after |
+|---|---|---|
+| Stroller `1024_cascade`, 12.0M raw | 0.370% → 0.325% | 0.015% → 0.000% |
+| Stroller `1536_cascade`, 32.7M raw | – → 0.240% | – → 0.016% |
+
+The long edges that remain in cut mode come from the decimator working on a mesh that is mostly boundary, not from the repair; pairing leaves far fewer. The fixed stroller at `1536_cascade` reaches the 200,000 target with both repairs. The 7 November results are kept under `benchmark/results-v3-spikes` and the benchmark was started again on the fixed code.

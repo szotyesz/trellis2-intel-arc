@@ -196,6 +196,25 @@ def test_simplify_mesh_reaches_target_through_clustering_pass():
     assert np.unique(edges, axis=0, return_counts=True)[1].max() <= 2
 
 
+def test_repair_keeps_geometry_with_int32_faces_on_large_meshes():
+    """The edge keys in orient_faces and split_non_manifold_vertices multiply two
+    vertex ids. With int32 faces, which SciPy and the simplifier hand back, that
+    overflowed on meshes above 46,341 vertices and stitched unrelated vertices
+    into triangles spanning the model."""
+    baker = load_baker()
+    sphere = trimesh.creation.icosphere(subdivisions=7)   # 163,842 vertices
+    v = np.asarray(sphere.vertices)
+    f = np.asarray(sphere.faces, dtype=np.int32)
+    for pair in (False, True):
+        v2, f2 = baker.make_edge_manifold(v, f, pair)
+        assert len(v2) == len(v)                      # a closed sphere needs no splits
+        lengths = np.linalg.norm(v2[f2[:, 0]] - v2[f2[:, 1]], axis=1)
+        assert lengths.max() < 3 * np.median(lengths)
+        out = trimesh.Trimesh(v2, f2, process=False)
+        assert abs(out.volume - sphere.volume) < 1e-6 * sphere.volume
+        assert f2.dtype == np.int64
+
+
 def test_nearest_voxel_fills_texels_off_the_shell():
     baker = load_baker()
     coords = np.array([[5, 5, 5], [9, 5, 5]])

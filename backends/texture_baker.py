@@ -27,6 +27,12 @@ def orient_faces(vertices, faces):
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import breadth_first_order, connected_components
 
+    # int64 throughout: the edge key below multiplies two vertex ids, which
+    # overflows int32 (the dtype SciPy's component labels and the simplifier
+    # return) on any mesh with more than 46,341 vertices. Colliding keys then
+    # pair unrelated edges, and the vertex split downstream merges corners of
+    # different vertices into triangles that span the model.
+    faces = np.asarray(faces, dtype=np.int64)
     F = len(faces)
     edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
     face_ids = np.tile(np.arange(F), 3)
@@ -98,7 +104,7 @@ def split_non_manifold_vertices(vertices, faces, pair_sheets=True):
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
 
-    faces = np.asarray(faces)
+    faces = np.asarray(faces, dtype=np.int64)  # see orient_faces on int32 overflow
     F = len(faces)
     # Edge slot c * F + i runs from corner c to corner (c + 1) % 3 of face i.
     edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
@@ -151,6 +157,7 @@ def split_non_manifold_vertices(vertices, faces, pair_sheets=True):
     cols = np.r_[np.where(same, b0, b1), np.where(same, b1, b0)]
     graph = coo_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)), shape=(3 * F, 3 * F))
     _, fan = connected_components(graph, directed=False)
+    fan = fan.astype(np.int64)
     _, fan_first = np.unique(fan, return_index=True)
     return np.asarray(vertices)[faces.reshape(-1)[fan_first]], fan.reshape(F, 3)
 
@@ -183,7 +190,7 @@ def cluster_vertices(vertices, faces, cell):
     _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
     inverse = inverse.ravel()
     merged = np.stack([np.bincount(inverse, weights=v[:, axis]) for axis in range(3)], axis=1) / counts[:, None]
-    f = inverse[np.asarray(faces)]
+    f = inverse[np.asarray(faces, dtype=np.int64)]
     f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
     f = f[np.unique(np.sort(f, axis=1), axis=0, return_index=True)[1]]
     return merged, f
@@ -199,7 +206,7 @@ def clean_faces(vertices, faces):
     The simplifier leaves a few thousand of these on large meshes, and xatlas
     does not cope well with them.
     """
-    f = np.asarray(faces)
+    f = np.asarray(faces, dtype=np.int64)
     keep = (f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])
     tri = np.asarray(vertices)[f]
     keep &= np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1) > 1e-14
@@ -219,6 +226,7 @@ def _decimate(v, f, target):
             break
         before = len(f)
         v, f = fast_simplification.simplify(v, f, 1.0 - target / len(f))
+        f = np.asarray(f, dtype=np.int64)
         if len(f) > before * 0.98:
             break
     return v, f
