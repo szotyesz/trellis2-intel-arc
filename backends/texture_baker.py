@@ -207,15 +207,47 @@ def clean_faces(vertices, faces):
     return f[np.sort(np.unique(np.sort(f, axis=1), axis=0, return_index=True)[1])]
 
 
-def simplify_mesh(vertices, faces, target, voxel_size=None, max_raw_faces=8_000_000, pair_sheets=False):
+def _decimate(v, f, target):
+    """Quadric-decimate to about `target` faces.
+
+    One call can stop early, so repeat until it reaches the target or stalls.
+    """
+    import fast_simplification
+
+    for _ in range(6):
+        if len(f) <= target * 1.05:
+            break
+        before = len(f)
+        v, f = fast_simplification.simplify(v, f, 1.0 - target / len(f))
+        if len(f) > before * 0.98:
+            break
+    return v, f
+
+
+def simplify_mesh(vertices, faces, target, voxel_size=None, max_raw_faces=8_000_000, pair_sheets=False, repair="pair"):
     """Repair, then decimate to about `target` faces.
+
+    `repair` says what to do with edges shared by three or more faces, which
+    the extractor and vertex clustering both produce:
+      - "pair" (default): keep the two faces that continue straight through
+        each such edge together and cut the rest into fans, before and after
+        decimation. Half the cracks of "cut", but xatlas takes 2-20 minutes.
+      - "cut": split every such edge into fans; unwraps in seconds.
+    `pair_sheets=True` is the old spelling of `repair="pair"`.
+
+    Either way the decimator moves the two sides of a cut independently, so
+    cuts open into cracks: on a 512-level mesh 3% of edges are open in the
+    raw mesh and 30% after decimation. Decimating before cutting leaves 9%
+    but makes xatlas run for over half an hour, and welding the sides back
+    together afterwards, by distance or by the decimator's collapse record,
+    removes a quarter to a half of the triangles. See docs/xpu-measurements.md.
 
     Meshes above `max_raw_faces` get a vertex-clustering pass first: the repair
     steps and the quadric simplifier would otherwise need tens of GiB of RAM
     and many minutes. Triangle count on a surface scales with 1 / cell^2.
     """
-    import fast_simplification
-
+    if pair_sheets:
+        repair = "pair"
     v = np.asarray(vertices, dtype=np.float64)
     f = np.asarray(faces)
     if len(f) > max_raw_faces:
@@ -224,25 +256,17 @@ def simplify_mesh(vertices, faces, target, voxel_size=None, max_raw_faces=8_000_
         # far more and left a 57M-triangle mesh fragmented, so stop at two.
         base = voxel_size if voxel_size else _mean_edge_length(v, f)
         v, f = cluster_vertices(v, f, base * min(2.0, np.ceil(np.sqrt(len(f) / max_raw_faces))))
-    v, f = make_edge_manifold(v, orient_faces(v, f), pair_sheets)
-    # One call can stop early, so repeat until it reaches the target or stalls.
-    for _ in range(6):
-        if len(f) <= target * 1.05:
-            break
-        before = len(f)
-        v, f = fast_simplification.simplify(v, f, 1.0 - target / len(f))
-        if len(f) > before * 0.98:
-            break
+    v, f = make_edge_manifold(v, orient_faces(v, f), repair == "pair")
+    v, f = _decimate(v, f, target)
     if len(f) > target * 1.3:
         # The simplifier keeps boundary edges, so it can stall on meshes with
         # many of them. Cluster the rest of the way.
         v, f = cluster_vertices(v, f, _mean_edge_length(v, f) * np.sqrt(len(f) / target))
-        if len(f) > target * 1.05:
-            v, f = fast_simplification.simplify(v, f, 1.0 - target / len(f))
+        v, f = _decimate(v, f, target)
     # Simplification creates new non-manifold edges, and xatlas can take tens
     # of minutes on them. Clean, orient, then repair again before unwrapping.
     f = clean_faces(v, f)
-    return make_edge_manifold(v, orient_faces(v, f), pair_sheets)
+    return make_edge_manifold(v, orient_faces(v, f), repair == "pair")
 
 
 def uv_unwrap(vertices, faces):

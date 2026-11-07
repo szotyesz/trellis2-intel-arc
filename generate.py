@@ -16,6 +16,11 @@ import traceback
 os.environ.setdefault("ATTN_BACKEND", "sdpa")
 os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
 os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
+# The decoders allocate a few multi-GiB tensors on top of many small ones.
+# Growing segments in place instead of reserving new ones stops the allocator
+# from failing with gigabytes reserved but unusable; the two inputs that ran
+# out of memory at 1024 and 1536 complete with this, at 19.6 and 20.2 GiB.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "TRELLIS.2"))
@@ -103,11 +108,13 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=49152)
     parser.add_argument("--texture-size", type=int, default=1024, choices=[512, 1024, 2048, 4096])
     parser.add_argument("--no-texture", action="store_true", help="Export the raw mesh as OBJ only")
-    parser.add_argument("--save-raw", action="store_true", help="Also write the raw mesh as OBJ (hundreds of MB)")
+    parser.add_argument("--save-raw", action="store_true",
+                        help="Also write the raw mesh as OBJ (hundreds of MB) and a .raw.npz for scripts/bake_raw.py")
     parser.add_argument("--target-faces", type=int, default=200000, help="Triangles in the final GLB")
-    parser.add_argument("--repair", default="cut", choices=["cut", "pair"],
-                        help="Non-manifold edge repair: 'pair' keeps sheets connected and makes fewer UV charts, "
-                             "but UV unwrapping then takes 6-11 minutes instead of under one")
+    parser.add_argument("--repair", default="pair", choices=["cut", "pair"],
+                        help="Non-manifold edge repair: 'pair' keeps sheets connected, which halves the cracks "
+                             "simplification opens but makes the UV unwrap take 2-20 minutes; "
+                             "'cut' splits every such edge and unwraps in seconds")
     parser.add_argument("--steps", type=int, default=None, help="Override sampler steps for all phases")
     args = parser.parse_args()
 
@@ -159,6 +166,10 @@ def main():
         with open(f"{args.output}.obj", "w") as f:
             np.savetxt(f, verts, fmt="v %.6f %.6f %.6f")
             np.savetxt(f, faces + 1, fmt="f %d %d %d")
+        # Everything scripts/bake_raw.py needs to redo the baking without a GPU.
+        np.savez(f"{args.output}.raw.npz", vertices=verts.astype(np.float32), faces=faces.astype(np.int32),
+                 coords=mesh.coords.cpu().numpy(), attrs=mesh.attrs.cpu().float().numpy(),
+                 origin=mesh.origin.cpu().numpy(), voxel_size=np.float32(mesh.voxel_size))
 
     if args.no_texture:
         return
@@ -179,7 +190,7 @@ def main():
 
     t0 = time.time()
     bake_verts, bake_faces = simplify_mesh(verts, faces, args.target_faces, voxel_size=voxel_size,
-                                           pair_sheets=args.repair == "pair")
+                                           repair=args.repair)
     del verts, faces
     free_ram()
     print(f"Simplified to {len(bake_faces):,} triangles in {time.time() - t0:.0f}s")

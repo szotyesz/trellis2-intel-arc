@@ -106,7 +106,7 @@ Clustering at 3 voxels, which the 57M mesh got, left it fragmented into 91K piec
 
 ### Pairing sheets at non-manifold edges
 
-An alternative repair pairs the two faces that continue straight through a non-manifold edge instead of cutting all of them apart. On the 512 machine mesh it gives 121K vertices for 200K faces instead of 203K, 51K boundary edges instead of 137K, and 24K UV charts instead of 38K, but xatlas takes 686 s instead of 24 s; 359 s against 25 s on the 1024 mesh. It is available as `--repair pair` and off by default. Its visual benefit has not been checked.
+An alternative repair pairs the two faces that continue straight through a non-manifold edge instead of cutting all of them apart. On the 512 machine mesh it gives 121K vertices for 200K faces instead of 203K, 51K boundary edges instead of 137K, and 24K UV charts instead of 38K, but xatlas takes 686 s instead of 24 s; 359 s against 25 s on the 1024 mesh. It was added as `--repair pair`, off by default, with its visual benefit unchecked; the bake comparison in the 2026-11-07 update below made it the default.
 
 ### Triton sparse convolution
 
@@ -117,3 +117,67 @@ One Triton kernel gathers the neighbour rows of each output row and multiplies t
 - Inputs under 16K rows use the loop: 2,048 rows at 1024 channels took 0.5 s per call in Triton and 0.04 s looped.
 
 So the gain is in decoding, not in generation time, which the flow transformers dominate. The earlier 9–12 GiB peaks at `1024_cascade` came from the loop's temporaries, which the chunking had already removed.
+
+## Update, 2026-11-07
+
+### GPU memory: allocator fragmentation
+
+The two remaining benchmark failures, fishbowl at `1024` and town at `1536_cascade`, died in a decoder layer norm asking for 4.6–5.1 GiB while the allocator held 5–7 GiB reserved but unusable. `torch==2.15.0+xpu` supports expandable segments on XPU, so `generate.py` now sets `PYTORCH_ALLOC_CONF=expandable_segments:True`. Both inputs then completed: fishbowl at 19.6 GiB peak with a 45.9M-triangle mesh, town at 20.2 GiB with 47.3M triangles. No other run changed.
+
+### Cracks in baked meshes
+
+The white patches on the farmer's knees at `1536_cascade`, the speckles on cloth and paper at the cascade levels and the holes in the interior's walls are all gaps in the mesh, not texture: the farmer's texture has 306 white texels in total. Measured on a saved 512 machine mesh (2.9M triangles), counting edges that have one face after merging vertices by position:
+
+| Step | Open edges |
+|---|---|
+| Raw extractor output | 3.3%, plus 221K edges shared by three or more faces |
+| After splitting those edges into fans | 3.3%: both sides of every cut still coincide |
+| After one quadric decimation pass to 200K | 30.3% |
+
+The decimator moves the two sides of each cut independently, so every cut opens into a crack. The same happens to the fishbowl at `512`: its glass is a double-walled shell with 4% such edges, so nearly the whole surface is cut, and after decimation it is 68,737 pieces with 134 triangles covering half the area. The first benchmark's repair gave faces on those edges private vertices, which produced isolated triangles instead of cracks and left that shell smooth, so the "regression" is the same defect in a different form.
+
+A render-based gap measure, pixels filled by a 5-pixel morphological closing of the silhouette at 768 px over four views, puts numbers on what the eye sees: the speckled typewriter at `1024_cascade` 7.6% of its silhouette, the farmer 0.8–0.9%, the clean-looking bear 0.4%.
+
+Fixes tried on the 512 mesh, none adopted:
+
+| Variant | Open edges after | Faces | Unwrap |
+|---|---|---|---|
+| Current: cut, decimate, cut | 30.6% | 199K | 24 s |
+| Decimate first, cut only for xatlas | 8.9%, gap pixels 0.36% against 0.91% | 179K | xatlas ran over 30 min on this and on the fishbowl before being killed |
+| Cut, decimate with borders locked | 12.0% | 852K, stalls far from the target | – |
+| Cut, decimate, weld open vertices within 1 or 2 voxels | 22.3% / 10.5% | 154K / 109K: the welds also collapse the triangles along the cuts | – |
+| Cut, decimate tracking collapses, weld copies of each original vertex | 9.8% | 80K: each survivor absorbed many originals whose other copies survived elsewhere, so the welds chain | 19 s |
+| Pair sheets first, decimate, weld within 2 voxels | 8.8% | 167K | – |
+
+On a 12.2M-triangle `1024` mesh, which goes through vertex clustering first, the picture is the same: 2.4% open edges raw, 27.8% after cut and decimation, 7.2% decimating first. Pairing then welding within 2 voxels gave 10.0% while keeping 186K of 200K faces there, against 109K on the 512 mesh, because a voxel is a smaller fraction of a final triangle at higher levels. Its unwrap time was not measured and it is not wired in.
+
+Filling the extractor's small holes first (3,147 loops of at most 16 edges and 0.03 perimeter) changed nothing downstream. The practical lever today is `--repair pair`, which halves the cuts; its bake comparison follows.
+
+### Pairing sheets: bake comparison
+
+Three `1024_cascade` meshes captured with `--save-raw` and baked both ways with `scripts/bake_raw.py`. Open edges are counted after merging vertices by position; gap pixels as above.
+
+| Asset, raw triangles | Open edges, cut → pair | Gap pixels, cut → pair | Unwrap, cut → pair |
+|---|---|---|---|
+| Typewriter, 22.3M | 24.4% → 13.9% | 5.39% → 0.53% | 17 s → 122 s |
+| Stroller, 12.0M | 43.8% → 27.9% | 2.45% → 0.49% | 2 s → 334 s |
+| Farmer, 17.5M | 55.5% → 30.4% | 0.64% → 0.28% | 3 s → 1,170 s |
+
+Pairing halves the open edges and removes most of the visible speckle: the typewriter's paper and the stroller's cloth read as surfaces again, and the farmer's shirt loses its noise. Texel hit rates and triangle counts are unchanged. The price is the unwrap, 2 to 20 minutes against seconds. `pair` is now the default, since the output is what matters here, and `--repair cut` remains for quick previews.
+
+### Background removal
+
+Scored on the 12 example images, each composited over white, grey, gradient and noise backgrounds, as IoU of the mask against the image's own alpha. SAM 2.1 large and SAM 3 through `transformers` 5.22.2 on the XPU.
+
+| Method | Mean IoU | Median | Notes |
+|---|---|---|---|
+| SAM 2, grid of 16 points, union of masks that touch at most one edge of the frame | 0.84 | 0.97 | Mid-grey backgrounds: farmer 0.21, bear 0.52, stroller 0.48. Scenes 0.5–0.7 |
+| SAM 2, true bounding box 5% loose | 0.78 | 0.95 | A box covering over 85% of the image makes the model pick the background; such boxes fall back to the grid |
+| SAM 2, centre point | 0.62 | 0.78 | Fails where the centre is a gap: wings 0.00 |
+| SAM 3, the object's name | 0.85 | 0.97 | The same number on every background. Keeps only what the name covers: farmer 0.72 without the basket, bear 0.77 without the pedestal. "room" found nothing. Several names are unioned: the farmer on a gradient scored 0.72 with "farmer", 0.84 with "farmer basket" and 0.98 with "farmer basket vegetables"; the phrase "farmer with a basket" stayed at 0.72 |
+| SAM 3, generic words "object", "thing", "product" | 0.03–0.15 | 0.00 | Unusable: the model needs a concrete noun |
+| SAM 3, bounding box | 0.02 | 0.00 | Not working through this API; not investigated |
+
+Picking the mask by SAM 2's own score chooses a part of the object (pineapple 0.00, machine 0.03 with a centre point); the largest of its three masks is the whole object. SAM 3's mask decoder crashed the XPU `group_norm` kernel with a segmentation fault; a group norm written in plain tensor operations avoids it. SAM 3 takes about 2 s per image on the B60 and 42 s on the CPU; SAM 2 under a second.
+
+`transformers` moved from 4.57.6 to 5.22.2 for SAM 3. A `512` generation on the new image produced 1.53M raw triangles for the pineapple against 1.55M before, within the run-to-run variation, and the unit tests pass.

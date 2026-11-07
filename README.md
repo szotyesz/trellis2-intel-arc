@@ -10,7 +10,7 @@ This is a fork of [trellis-mac](https://github.com/shivampkumar/trellis-mac). Th
 - Docker with Compose.
 - 30 GB of system RAM has been enough; a run peaks at about 17 GiB, and the container is capped at 26 GiB.
 - Disk space for the model weights.
-- A Hugging Face read token, with access approved for the gated [DINOv3 weights](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m).
+- A Hugging Face read token, with access approved for the gated [DINOv3 weights](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m). For the optional SAM 3 background removal, also for the gated [SAM 3 weights](https://huggingface.co/facebook/sam3).
 
 ## Setup
 
@@ -24,11 +24,17 @@ docker compose run --rm fetch-weights                  # the only step with netw
 docker compose run --rm --no-deps cpu-tests            # no GPU needed
 ```
 
+For SAM 3 background removal, fetch its weights too, after accepting Meta's licence on the Hugging Face page:
+
+```sh
+docker compose run --rm fetch-weights /opt/venv/bin/python scripts/fetch_weights.py --with sam3
+```
+
 `compose.yaml` sets the host's `video` and `render` group IDs (`983`, `987`). Change them if yours differ: `getent group video render`.
 
 ## Generate
 
-Put an image with a **transparent background** in `input/`. Background removal is not included, and an opaque image stops with an error.
+Put an image with a **transparent background** in `input/`. An opaque image stops with an error; cut the object out first with `scripts/cutout.py` (below).
 
 ```sh
 docker compose run --rm trellis /opt/venv/bin/python generate.py \
@@ -45,11 +51,32 @@ A run can use nearly all of the card's memory, so stop anything else that is usi
 | `--seed` | `42` | Random seed. Results still vary slightly between runs |
 | `--target-faces` | `200000` | Triangles in the GLB |
 | `--texture-size` | `1024` | `512`, `1024`, `2048` or `4096` |
-| `--repair` | `cut` | How non-manifold edges are repaired before baking. `pair` keeps surfaces better connected and makes about a third fewer UV charts, but UV unwrapping then takes 6–11 minutes instead of under one |
+| `--repair` | `pair` | How non-manifold edges are repaired before baking. `pair` halves the cracks that simplification opens and removes most speckle on cloth and paper. `cut` unwraps in seconds instead of 2–20 minutes, at the cost of those cracks; use it for quick previews |
 | `--max-tokens` | `49152` | Upper limit on sparse tokens in cascade pipelines |
 | `--steps` | model default | Sampler steps for all phases |
 | `--no-texture` | off | Write only the raw mesh as OBJ |
-| `--save-raw` | off | Also write the raw OBJ, which can reach hundreds of MB |
+| `--save-raw` | off | Also write the raw OBJ, which can reach hundreds of MB, and a `.raw.npz` that `scripts/bake_raw.py` can bake again on the CPU with other options |
+
+### Background removal
+
+`scripts/cutout.py` writes the RGBA image from a photo, using Meta's Segment Anything models. Name the object and each thing it carries for SAM 3, or give nothing and SAM 2 finds a free-standing object on its own:
+
+```sh
+docker compose run --rm trellis /opt/venv/bin/python scripts/cutout.py \
+  /input/photo.jpg /out/photo.png --prompt farmer basket vegetables
+docker compose run --rm trellis /opt/venv/bin/python scripts/cutout.py \
+  /input/photo.jpg /out/photo.png
+```
+
+Measured on the 12 example images composited over white, grey, gradient and noise backgrounds, against their true alpha:
+
+| | Needs | Mean IoU | Where it fails |
+|---|---|---|---|
+| SAM 3, `--prompt` | Noun phrases, gated weights | 0.85 | Keeps only what the phrases name: the farmer alone scores 0.72, with "basket" and "vegetables" added 0.98. A generic word like "object" finds nothing |
+| SAM 2, no prompt | Nothing | 0.84 | Object and background alike, such as a grey object on grey: 0.2–0.5. Scenes: 0.5–0.7 |
+| SAM 2, `--box` | A pixel box | 0.78 | Scenes |
+
+Both take about a second on the GPU. SAM 3 was 848M parameters and about 2 s per image; a plain-PyTorch group norm replaces the XPU kernel that crashed on its mask decoder.
 
 ## Choosing a pipeline type
 
@@ -57,9 +84,10 @@ A run can use nearly all of the card's memory, so stop anything else that is usi
 
 ## Limitations
 
-- **GPU memory:** every input retested after the convolution fixes completes at every level, with peak VRAM up to about 19 GiB at `1536_cascade`. A run that does run out exits with an error rather than hanging.
+- **GPU memory:** every benchmark input completes at every level once the allocator is allowed to grow its segments (`PYTORCH_ALLOC_CONF=expandable_segments:True`, set by `generate.py`), with peak VRAM up to 20.2 GiB on the town at `1536_cascade`. Without it, two scene-like inputs failed with gigabytes reserved but unusable. A run that does run out exits with an error rather than hanging.
 - **First run:** Triton compiles the convolution kernel on first use, about 10 s once per cache volume.
 - **Fine parts:** thin structures can break up or become floating specks.
+- **Cracks:** the repair of non-manifold edges cuts the mesh, and simplification then opens the cuts into hairline cracks, which show as speckles on cloth and paper and as small holes at the cascade levels. The default `--repair pair` removes most of them; `--repair cut` brings them back together with a fast unwrap. The measurements document records the cause and the fixes that did not work.
 - **Colour:** output is often darker or less saturated than the input. The cause has not been fully traced; see the measurements.
 - **Transparency:** glass comes out as an opaque shell.
 - **Scenes:** whole rooms and towns only look right from the input's side.
@@ -72,7 +100,7 @@ A run can use nearly all of the card's memory, so stop anything else that is usi
 | CUDA mesh extraction (`o_voxel`) | `backends/mesh_extract.py`, plain PyTorch |
 | `nvdiffrast` texture baking | `backends/texture_baker.py`, NumPy and xatlas on the CPU |
 | CuMesh repair and simplification | `backends/texture_baker.py`: vertex clustering for huge meshes, winding repair, non-manifold vertex splitting, `fast_simplification` |
-| RMBG-2.0 background removal | Removed, because of its non-commercial licence |
+| RMBG-2.0 background removal | Removed, because of its non-commercial licence. `scripts/cutout.py` offers SAM 3 and SAM 2 instead |
 
 `patches/xpu_compat.py` patches upstream at image build time and fails the build if an expected line is missing. CPU fallback stays disabled, so a missing XPU operator raises an error rather than silently running slowly. GPU containers run with no network.
 
@@ -85,7 +113,9 @@ The port's own code is MIT. The goal is that nothing in the default pipeline pro
 - **TRELLIS.2 code and weights:** [MIT](https://github.com/microsoft/TRELLIS.2/blob/main/LICENSE). A residual risk remains around the data the model was trained on.
 - **DINOv3 weights:** [Meta's custom licence](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/blob/main/LICENSE.md), gated and with end-use restrictions. Review it before commercial use.
 - **Intel runtime components:** Intel's EULA forbids offering them as a hosted service or service bureau. Check this if you plan to run generation as a service for others.
-- **Excluded because they forbid commercial use:** RMBG-2.0, `nvdiffrast` and `nvdiffrec`. Do not add them back, and do not import upstream's `o_voxel.postprocess`, which imports `nvdiffrast`.
+- **SAM 2.1 weights:** [Apache 2.0](https://github.com/facebookresearch/sam2), trained on Meta's own data.
+- **SAM 3 weights:** [Meta's SAM License](https://huggingface.co/facebook/sam3), gated and optional. Royalty-free and commercial use is allowed, but it is not an open-source licence: it excludes military and sanctioned uses, must be passed on with any redistribution of the model, and Meta can change it. The SAM 2 path stays as the fallback.
+- **Excluded because they forbid commercial use:** RMBG-2.0, `nvdiffrast` and `nvdiffrec`. Do not add them back, and do not import upstream's `o_voxel.postprocess`, which imports `nvdiffrast`. Also excluded: BiRefNet, BEN2, InSPyReNet and u2net, whose MIT or Apache weights were trained on DIS5K or DUTS, datasets whose terms forbid commercial use even of derived work.
 
 ## Credits
 
