@@ -232,14 +232,62 @@ def _decimate(v, f, target):
     return v, f
 
 
-def simplify_mesh(vertices, faces, target, voxel_size=None, max_raw_faces=8_000_000, pair_sheets=False, repair="pair"):
+def off_surface_fraction(vertices, faces, coords, origin, voxel_size):
+    """Share of face area whose centroid has no occupied voxel within one voxel.
+
+    A proxy for the texels the baker will miss: faces that bridge a gap or
+    span the interior of a solid instead of following the voxel shell.
+    """
+    v = np.asarray(vertices, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int64)
+    c = np.asarray(coords, dtype=np.int64)
+    span = int(c.max()) + 2
+
+    def key(cells):
+        return (cells[:, 0] * span + cells[:, 1]) * span + cells[:, 2]
+
+    occupied = np.unique(key(c))
+    cell = np.floor((v[f].mean(axis=1) - np.asarray(origin)) / voxel_size).astype(np.int64)
+    hit = np.zeros(len(f), dtype=bool)
+    for d in np.array(np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1])).reshape(3, -1).T:
+        n = cell + d
+        inside = ((n >= 0) & (n < span)).all(axis=1)
+        k = key(n[inside])
+        i = np.minimum(np.searchsorted(occupied, k), len(occupied) - 1)
+        hit[np.flatnonzero(inside)[occupied[i] == k]] = True
+    tri = v[f]
+    area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    return float(area[~hit].sum() / max(area.sum(), 1e-30))
+
+
+def _repair_and_decimate(v, f, target, pair):
+    v, f = make_edge_manifold(v, orient_faces(v, f), pair)
+    v, f = _decimate(v, f, target)
+    if len(f) > target * 1.3:
+        # The simplifier keeps boundary edges, so it can stall on meshes with
+        # many of them. Cluster the rest of the way.
+        v, f = cluster_vertices(v, f, _mean_edge_length(v, f) * np.sqrt(len(f) / target))
+        v, f = _decimate(v, f, target)
+    # Simplification creates new non-manifold edges, and xatlas can take tens
+    # of minutes on them. Clean, orient, then repair again before unwrapping.
+    f = clean_faces(v, f)
+    return make_edge_manifold(v, orient_faces(v, f), pair)
+
+
+def simplify_mesh(vertices, faces, target, voxel_size=None, max_raw_faces=8_000_000, pair_sheets=False, repair="pair",
+                  coords=None, origin=None, off_surface_limit=0.03, log=print):
     """Repair, then decimate to about `target` faces.
 
     `repair` says what to do with edges shared by three or more faces, which
     the extractor and vertex clustering both produce:
       - "pair" (default): keep the two faces that continue straight through
         each such edge together and cut the rest into fans, before and after
-        decimation. Half the cracks of "cut", but xatlas takes 2-20 minutes.
+        decimation. Half the cracks of "cut", but xatlas takes minutes to an
+        hour. On some meshes the decimator stalls above the target on the
+        paired mesh and flattens it into large facets off the surface; when
+        `coords` and `origin` are given, the cut repair is run as well and
+        chosen if it leaves `off_surface_limit` less of the area off the
+        voxel shell, or whenever pairing stalled.
       - "cut": split every such edge into fans; unwraps in seconds.
     `pair_sheets=True` is the old spelling of `repair="pair"`.
 
@@ -257,24 +305,31 @@ def simplify_mesh(vertices, faces, target, voxel_size=None, max_raw_faces=8_000_
     if pair_sheets:
         repair = "pair"
     v = np.asarray(vertices, dtype=np.float64)
-    f = np.asarray(faces)
+    f = np.asarray(faces, dtype=np.int64)
     if len(f) > max_raw_faces:
         # Cells of two voxels merge the two sides of one-voxel walls into one
         # sheet, which the repair below handles well. Three-voxel cells merge
         # far more and left a 57M-triangle mesh fragmented, so stop at two.
         base = voxel_size if voxel_size else _mean_edge_length(v, f)
         v, f = cluster_vertices(v, f, base * min(2.0, np.ceil(np.sqrt(len(f) / max_raw_faces))))
-    v, f = make_edge_manifold(v, orient_faces(v, f), repair == "pair")
-    v, f = _decimate(v, f, target)
-    if len(f) > target * 1.3:
-        # The simplifier keeps boundary edges, so it can stall on meshes with
-        # many of them. Cluster the rest of the way.
-        v, f = cluster_vertices(v, f, _mean_edge_length(v, f) * np.sqrt(len(f) / target))
-        v, f = _decimate(v, f, target)
-    # Simplification creates new non-manifold edges, and xatlas can take tens
-    # of minutes on them. Clean, orient, then repair again before unwrapping.
-    f = clean_faces(v, f)
-    return make_edge_manifold(v, orient_faces(v, f), repair == "pair")
+    if repair != "pair":
+        return _repair_and_decimate(v, f, target, False)
+    vp, fp = _repair_and_decimate(v, f, target, True)
+    stalled = len(fp) > target * 1.1
+    if coords is None or voxel_size is None:
+        return vp, fp
+    off_pair = off_surface_fraction(vp, fp, coords, origin, voxel_size)
+    if not stalled and off_pair <= off_surface_limit:
+        log(f"Repair: pair, {off_pair:.1%} of the area off the surface")
+        return vp, fp
+    vc, fc = _repair_and_decimate(v, f, target, False)
+    off_cut = off_surface_fraction(vc, fc, coords, origin, voxel_size)
+    why = "stalled at {:,} faces".format(len(fp)) if stalled else f"{off_pair:.1%} of the area off the surface"
+    if stalled or off_cut + off_surface_limit < off_pair:
+        log(f"Repair: cut, because pairing {why} (cut: {off_cut:.1%} off the surface)")
+        return vc, fc
+    log(f"Repair: pair, {off_pair:.1%} of the area off the surface (cut: {off_cut:.1%})")
+    return vp, fp
 
 
 def uv_unwrap(vertices, faces):

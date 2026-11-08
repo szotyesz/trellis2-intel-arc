@@ -37,7 +37,7 @@ def main():
     print(f"Mesh: {len(verts):,} vertices, {len(faces):,} triangles")
     t0 = time.time()
     bake_verts, bake_faces = simplify_mesh(verts, faces, args.target_faces, voxel_size=voxel_size,
-                                           repair=args.repair)
+                                           repair=args.repair, coords=d["coords"], origin=d["origin"])
     del verts, faces
     print(f"Simplified to {len(bake_faces):,} triangles in {time.time() - t0:.0f}s")
     normals = trimesh.Trimesh(bake_verts, bake_faces, process=False).vertex_normals

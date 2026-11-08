@@ -190,7 +190,7 @@ def main():
 
     t0 = time.time()
     bake_verts, bake_faces = simplify_mesh(verts, faces, args.target_faces, voxel_size=voxel_size,
-                                           repair=args.repair)
+                                           repair=args.repair, coords=coords, origin=origin)
     del verts, faces
     free_ram()
     print(f"Simplified to {len(bake_faces):,} triangles in {time.time() - t0:.0f}s")

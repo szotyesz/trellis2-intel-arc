@@ -196,3 +196,23 @@ Same raw mesh, before and after the fix, long edges after the final repair:
 | Stroller `1536_cascade`, 32.7M raw | – → 0.240% | – → 0.016% |
 
 The long edges that remain in cut mode come from the decimator working on a mesh that is mostly boundary, not from the repair; pairing leaves far fewer. The fixed stroller at `1536_cascade` reaches the 200,000 target with both repairs. The 7 November results are kept under `benchmark/results-v3-spikes` and the benchmark was started again on the fixed code.
+
+### Pairing stalls on some meshes: an off-surface guard
+
+The benchmark on the fixed repair (8 November, 52 of 52 real runs successful) brought back one of the two 1536 problems in a different form. On the farmer at `1536_cascade` the quadric simplifier stopped at 243,837 faces on the paired mesh, with the hat and hands flattened into large facets, and the baker's trilinear hit rate fell from 94.5% to 85.5%; on the town it stalled far above the target, so the clustering fallback ran and overshot to 79,319 faces with a 58% hit rate. The same meshes with the cut repair reach the target in two passes. The simplifier's aggressiveness setting is not a lever: level 5 changes little and level 3 stalls everywhere.
+
+The practical measure is the share of face area whose centroid has no occupied voxel within one voxel, a proxy for the texels the baker will miss. Pair against cut on the same raw mesh, after the final repair:
+
+| Raw mesh | Pair | Cut | Chosen |
+|---|---|---|---|
+| Fishbowl `512`, 7.3M | 0.3% | 0.2% | pair |
+| Stroller `1024_cascade`, 12.0M | 0.3% | 3.3% | pair |
+| Typewriter `1024_cascade`, 22.3M | 1.3% | 1.7% | pair |
+| Plant `1024_cascade`, 5.5M | 1.1% | 0.8% | pair |
+| Farmer `1024_cascade`, 17.5M | 2.0% | 3.2% | pair |
+| Stroller `1536_cascade`, 32.7M | 6.7% | 6.0% | pair |
+| Town `1024`, 25.7M | 11.3% | 11.1% | pair |
+| Farmer `1536_cascade`, 54.4M | 14.8% | 2.7% | cut |
+| Town `1536_cascade`, 45.6M | 40.8% | 9.6% | cut |
+
+`simplify_mesh` now applies this: with `--repair pair` it decimates the paired mesh and, if more than 3% of the area is off the surface or the decimator stopped more than 10% above the target, decimates the cut mesh as well and keeps the cut result when that lies at least 3 percentage points closer to the surface. On the seven meshes where pairing is sound this costs nothing or one extra decimation of about a minute; on the two where it fails it restores the cut result, with its cracks but on the surface. The generator prints which repair was used and why. The town at `1024` shows that the proxy also measures what pairing cannot fix: a scene with many thin walls loses a tenth of its area to bridging triangles under either repair.

@@ -51,7 +51,7 @@ A run can use nearly all of the card's memory, so stop anything else that is usi
 | `--seed` | `42` | Random seed. Results still vary slightly between runs |
 | `--target-faces` | `200000` | Triangles in the GLB |
 | `--texture-size` | `1024` | `512`, `1024`, `2048` or `4096` |
-| `--repair` | `pair` | How non-manifold edges are repaired before baking. `pair` halves the cracks that simplification opens and removes most speckle on cloth and paper. `cut` unwraps in seconds instead of 2–20 minutes, at the cost of those cracks; use it for quick previews |
+| `--repair` | `pair` | How non-manifold edges are repaired before baking. `pair` halves the cracks that simplification opens and removes most speckle on cloth and paper, but UV unwrapping takes minutes to an hour instead of seconds. On a few meshes the simplifier stalls on the paired mesh and flattens it; `pair` detects this and falls back to `cut` for that mesh, printing why. `cut` always cuts, for quick previews |
 | `--max-tokens` | `49152` | Upper limit on sparse tokens in cascade pipelines |
 | `--steps` | model default | Sampler steps for all phases |
 | `--no-texture` | off | Write only the raw mesh as OBJ |
@@ -87,7 +87,7 @@ Both take about a second on the GPU. SAM 3 was 848M parameters and about 2 s per
 - **GPU memory:** every benchmark input completes at every level once the allocator is allowed to grow its segments (`PYTORCH_ALLOC_CONF=expandable_segments:True`, set by `generate.py`), with peak VRAM up to 20.2 GiB on the town at `1536_cascade`. Without it, two scene-like inputs failed with gigabytes reserved but unusable. A run that does run out exits with an error rather than hanging.
 - **First run:** Triton compiles the convolution kernel on first use, about 10 s once per cache volume.
 - **Fine parts:** thin structures can break up or become floating specks.
-- **Cracks:** the repair of non-manifold edges cuts the mesh, and simplification then opens the cuts into hairline cracks, which show as speckles on cloth and paper and as small holes at the cascade levels. The default `--repair pair` removes most of them; `--repair cut` brings them back together with a fast unwrap. The measurements document records the cause and the fixes that did not work.
+- **Cracks:** the repair of non-manifold edges cuts the mesh, and simplification then opens the cuts into hairline cracks, which show as speckles on cloth and paper and as small holes at the cascade levels. The default `--repair pair` removes most of them at the price of a slow unwrap; `--repair cut` brings them back together with a fast unwrap. The measurements document records the cause, the fixes that did not work, and the meshes where pairing has to fall back to cutting.
 - **Colour:** output is often darker or less saturated than the input. The cause has not been fully traced; see the measurements.
 - **Transparency:** glass comes out as an opaque shell.
 - **Scenes:** whole rooms and towns only look right from the input's side.
