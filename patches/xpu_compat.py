@@ -58,23 +58,27 @@ def patch_sparse_attention():
         print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
         return
 
-    # One sample only: the padded multi-sample form passed no mask, so shorter
-    # samples would attend to padding. The last dim must keep stride 1, which
-    # the fused oneDNN backend requires.
+    # One call per sample. Samples differ in length, and padding them into
+    # one batch would need a mask to keep short samples from attending to the
+    # padding. The last dim must keep stride 1, which the fused oneDNN
+    # backend requires; slicing rows keeps it.
     sdpa_block = """\
     elif config.ATTN in ('sdpa', 'naive'):
         from torch.nn.functional import scaled_dot_product_attention as sdpa_fn
-        if len(q_seqlen) != 1:
-            raise NotImplementedError("The sdpa backend supports one sample at a time")
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)
         elif num_all_args == 2:
             k, v = kv.unbind(dim=1)
-        out = sdpa_fn(
-            q.unsqueeze(0).transpose(1, 2),
-            k.unsqueeze(0).transpose(1, 2),
-            v.unsqueeze(0).transpose(1, 2),
-        ).transpose(1, 2).squeeze(0)
+        out, q_start, kv_start = [], 0, 0
+        for q_len, kv_len in zip(q_seqlen, kv_seqlen):
+            out.append(sdpa_fn(
+                q[q_start:q_start + q_len].unsqueeze(0).transpose(1, 2),
+                k[kv_start:kv_start + kv_len].unsqueeze(0).transpose(1, 2),
+                v[kv_start:kv_start + kv_len].unsqueeze(0).transpose(1, 2),
+            ).transpose(1, 2).squeeze(0))
+            q_start += q_len
+            kv_start += kv_len
+        out = out[0] if len(out) == 1 else torch.cat(out)
 """
 
     src = must_replace(src,
@@ -315,6 +319,28 @@ def patch_pipeline():
     write_file(path, src)
 
 
+def patch_num_samples():
+    """Give every sample its own copy of the image conditioning.
+
+    Upstream's run() draws `num_samples` noise tensors but conditions on a
+    batch of one image, which its sparse cross-attention rejects.
+    """
+    path = os.path.join(TRELLIS_ROOT, "trellis2/pipelines/trellis2_image_to_3d.py")
+    src = read_file(path)
+
+    if "[image] * num_samples" in src:
+        print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
+        return
+
+    src = must_replace(src,
+        "        cond_512 = self.get_cond([image], 512)\n"
+        "        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None\n",
+        "        cond_512 = self.get_cond([image] * num_samples, 512)\n"
+        "        cond_1024 = self.get_cond([image] * num_samples, 1024) if pipeline_type != '512' else None\n",
+    )
+    write_file(path, src)
+
+
 def patch_pipeline_base():
     """Fix hardcoded cuda device in Pipeline.cuda()."""
     path = os.path.join(TRELLIS_ROOT, "trellis2/pipelines/base.py")
@@ -398,6 +424,7 @@ def main():
     patch_mesh_base()
     patch_fdg_vae()
     patch_pipeline()
+    patch_num_samples()
     patch_pipeline_base()
     install_conv_backend()
     install_mesh_extract()

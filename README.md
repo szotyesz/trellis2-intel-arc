@@ -1,12 +1,12 @@
 # TRELLIS.2 on Intel Arc Pro B60: image-to-3D with PyTorch XPU, no CUDA
 
-Run Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) image-to-3D model (`TRELLIS.2-4B`) on an **Intel Arc Pro B60** (24 GB) under Linux, using PyTorch's XPU backend in Docker. No NVIDIA GPU, no CUDA and no oneAPI install on the host. One cut-out image goes in, a textured PBR mesh (GLB) comes out.
+Run Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) image-to-3D model (`TRELLIS.2-4B`) on an **Intel Arc Pro B60** (24 GB) under Linux, using PyTorch's XPU backend in Docker. No NVIDIA GPU, no CUDA and no oneAPI install on the host. One cut-out image goes in, a textured PBR mesh (GLB) comes out. It can also texture a mesh you already have, and run several images in one go.
 
 ![Input image and three views of the mesh TRELLIS.2 generated from it on an Intel Arc Pro B60](assets/machine_1024_cascade.jpg)
 
 *Input (left, one of upstream's example images) and the GLB generated at `1024_cascade` on the B60, rendered from three sides.*
 
-Upstream TRELLIS.2 runs only on NVIDIA cards: it calls `.cuda()` directly and depends on the CUDA extensions `flex_gemm`, `o_voxel`, `cumesh`, `nvdiffrast` and `flash_attn`. This port replaces each of them, so the whole image-to-3D pipeline runs on an Intel GPU through `torch.xpu`.
+Upstream TRELLIS.2 runs only on NVIDIA cards: it calls `.cuda()` directly and depends on the CUDA extensions `flex_gemm`, `o_voxel`, `cumesh`, `nvdiffrast` and `flash_attn`. This port replaces each of them, so the image-to-3D pipeline and the texturing pipeline both run on an Intel GPU through `torch.xpu`.
 
 | | |
 |---|---|
@@ -15,8 +15,10 @@ Upstream TRELLIS.2 runs only on NVIDIA cards: it calls `.cuda()` directly and de
 | Pipelines | `512`, `1024`, `1024_cascade`, `1536_cascade`: all 12 benchmark inputs complete at every level |
 | Time on the GPU | Median 30 s at `512`, 100 s at `1024` and `1024_cascade`, 300 s at `1536_cascade`, plus CPU post-processing |
 | Peak VRAM | 2.6–4.6 GiB at `512`, up to about 20 GiB at the higher levels |
-| Output | GLB with 200,000 triangles, base colour and metallic-roughness textures |
-| Not ported | Upstream's texturing pipeline, Gradio app, video rendering and training |
+| Output | GLB with 200,000 triangles, base colour with alpha and metallic-roughness textures; glass is exported as a blended material |
+| Texturing | `texture.py` paints an existing mesh from an image, as upstream's `Trellis2TexturingPipeline` does |
+| Batches | Several images, or several seeds of one, in a single run that loads the models once |
+| Not ported | Upstream's Gradio apps, video rendering and training |
 
 This started as a fork of [trellis-mac](https://github.com/shivampkumar/trellis-mac), the Apple Silicon port. The Mac and Metal paths have been removed.
 
@@ -65,13 +67,36 @@ A run can use nearly all of the card's memory, so stop anything else that is usi
 |---|---|---|
 | `--pipeline-type` | `512` | `512`, `1024`, `1024_cascade` or `1536_cascade` |
 | `--seed` | `42` | Random seed. Results still vary slightly between runs |
+| `--num-samples` | `1` | Meshes per image. Sample *i* uses seed + *i* and is written as `<name>_s<seed>.glb` |
+| `--output` | `/out/output_3d` | Output path without extension, for one image |
+| `--output-dir` | `/out` | Where several images are written, each under its own file name |
 | `--target-faces` | `200000` | Triangles in the GLB |
 | `--texture-size` | `1024` | `512`, `1024`, `2048` or `4096` |
 | `--repair` | `pair` | How non-manifold edges are repaired before baking. `pair` halves the cracks that simplification opens and removes most speckle on cloth and paper, but UV unwrapping takes minutes to an hour instead of seconds. If the simplifier stalls on a paired mesh and flattens it, `pair` falls back to `cut` for that mesh, printing why. `cut` always cuts, for quick previews |
+| `--alpha-mode` | `auto` | What the GLB does with the alpha the model predicts. `auto` blends when part of the surface is transparent and is opaque otherwise; `blend`, `mask` and `opaque` force one. Alpha is stored in the base colour texture in every mode. See [Transparency](#transparency) |
 | `--max-tokens` | `49152` | Upper limit on sparse tokens in cascade pipelines |
 | `--steps` | model default | Sampler steps for all phases |
 | `--no-texture` | off | Write only the raw mesh as OBJ |
 | `--save-raw` | off | Also write the raw OBJ, which can reach hundreds of MB, and a `.raw.npz` that `scripts/bake_raw.py` can bake again on the CPU with other options |
+
+### Several images or seeds in one run
+
+Give `generate.py` more than one image, or `--num-samples`, and it loads the models once and runs each stage for every job before moving to the next stage, so every model is still dropped from RAM as soon as its stage is over:
+
+```sh
+docker compose run --rm trellis /opt/venv/bin/python generate.py \
+  /input/chair.png /input/lamp.png --pipeline-type 1024_cascade --output-dir /out
+docker compose run --rm trellis /opt/venv/bin/python generate.py \
+  /input/chair.png --num-samples 4 --output /out/chair       # chair_s42.glb … chair_s45.glb
+```
+
+Each job draws its noise from its own seed, in the order a run on its own would, so a batch does not change what a seed produces. A job that fails, for example an opaque image or one that runs out of GPU memory, is reported at the end and the others still finish; the exit status is then 1.
+
+The jobs run one after another on the GPU, not side by side: one mesh can already take most of 24 GB at the higher levels. The sparse attention itself accepts several samples in one pass, so upstream's `pipeline.run(image, num_samples=N)` works from Python where the memory allows; at `512` two samples in one pass took 36 s against 26.5 s for one.
+
+### Transparency
+
+TRELLIS.2 predicts an alpha value for every voxel: about 1.0 on solid surfaces, 0.5 or less on glass. Upstream stores it in the base colour texture but marks the material opaque, so viewers ignore it. Here `--alpha-mode auto` (the default) checks how much of the surface is transparent. If it is under 0.5% of the area the GLB is opaque, as before. Otherwise the faces with transparent texels go into a second primitive with a blended material while the rest stay opaque, so the solid parts still write depth and do not sort against the glass. `--alpha-mode opaque` gives upstream's behaviour, `blend` and `mask` force those modes.
 
 ### Background removal
 
@@ -94,6 +119,29 @@ Measured on the 12 example images composited over white, grey, gradient and nois
 
 Both take about a second on the GPU. SAM 3 was 848M parameters and about 2 s per image; a plain-PyTorch group norm replaces the XPU kernel that crashed on its mask decoder.
 
+## Texture an existing mesh
+
+`texture.py` is the port of upstream's texturing pipeline. It takes a mesh and an image of the object, and writes the same mesh with a PBR texture painted to match the image:
+
+```sh
+docker compose run --rm trellis /opt/venv/bin/python texture.py \
+  /input/knight.glb /input/knight.png --output /out/knight
+```
+
+The mesh is voxelised on the CPU, encoded to a shape latent on the GPU, and the texture model then generates colour, metallic, roughness and alpha for exactly those voxels, which are baked into a texture. The geometry is not changed: the output has the input's vertices, faces, size and position.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--resolution` | `1024` | Voxel grid the mesh is encoded at, `512` or `1024` |
+| `--texture-size` | `2048` | `512`, `1024`, `2048` or `4096` |
+| `--seed` | `42` | Random seed |
+| `--steps` | model default | Sampler steps |
+| `--z-up` | off | The mesh's up axis is Z. The default is Y, as in glTF |
+| `--unwrap` | off | Make new UVs with xatlas even if the mesh has its own. Meshes without UVs, or with UVs outside the unit square, are always unwrapped |
+| `--alpha-mode` | `auto` | As for `generate.py` |
+
+The image needs a transparent background, like the input of `generate.py`, and should show the object from the front, upright. The mesh should be upright too; if it comes from a Z-up tool as OBJ or PLY, pass `--z-up`.
+
 ## Choosing a pipeline type
 
 `1024_cascade` is the best balance for solid objects. `512` is the fallback for anything that fails. `1536_cascade` shows little extra detail once baked to 200,000 triangles.
@@ -107,7 +155,7 @@ Generation on the GPU takes a median of about 30 s at `512`, 100 s at `1024` and
 - **Fine parts:** thin structures can break up or become floating specks.
 - **Cracks:** the repair of non-manifold edges cuts the mesh, and simplification then opens the cuts into hairline cracks, which show as speckles on cloth and paper and as small holes at the cascade levels. The default `--repair pair` removes most of them at the price of a slow unwrap; `--repair cut` brings them back together with a fast unwrap. The measurements document records the cause, the fixes that did not work, and the meshes where pairing has to fall back to cutting.
 - **Colour:** output is often darker or less saturated than the input. The cause has not been fully traced; see the measurements.
-- **Transparency:** glass comes out as an opaque shell.
+- **Transparency:** glass is exported with a blended material (see [Transparency](#transparency)), which is plain alpha blending: no refraction, and viewers that do not sort blended triangles can draw the far side of a bowl over the near side.
 - **Scenes:** whole rooms and towns only look right from the input's side. The triangle budget is tight for them: at 200,000 triangles the town's facades are a few voxels off the surface over a tenth of their area, which the final decimation stage keeps from turning into triangles that span windows and alleys.
 
 ## FAQ
@@ -134,9 +182,10 @@ Generation on the GPU takes a median of about 30 s at `512`, 100 s at `1024` and
 
 | Upstream needs | Here |
 |---|---|
-| `flash_attn` or `xformers` attention | PyTorch's `scaled_dot_product_attention`, which XPU runs with oneDNN's fused kernel; memory grows linearly with tokens in bf16 and fp16 |
+| `flash_attn` or `xformers` attention | PyTorch's `scaled_dot_product_attention`, which XPU runs with oneDNN's fused kernel, one call per sample of a batch; memory grows linearly with tokens in bf16 and fp16 |
 | CUDA sparse convolution (FlexGEMM) | `backends/conv_none.py`: a Triton gather-matmul kernel on XPU, a plain PyTorch loop on CPU and as fallback |
 | CUDA mesh extraction (`o_voxel`) | `backends/mesh_extract.py`, plain PyTorch |
+| Mesh voxelisation for texturing (`o_voxel`, C++) | `backends/dual_grid.py`, NumPy on the CPU, tested against a transcription of the C++ |
 | `nvdiffrast` texture baking | `backends/texture_baker.py`, NumPy and xatlas on the CPU |
 | CuMesh repair and simplification | `backends/texture_baker.py`: vertex clustering for huge meshes, winding repair, non-manifold vertex splitting, `fast_simplification` to four times the target, then `backends/surface_decimate.py`, a quadric decimator that refuses collapses whose triangles leave the voxel shell |
 | RMBG-2.0 background removal | Removed, because of its non-commercial licence. `scripts/cutout.py` offers SAM 3 and SAM 2 instead |

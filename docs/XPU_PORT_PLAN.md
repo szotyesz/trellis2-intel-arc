@@ -52,6 +52,8 @@ First results should need almost no kernel work. The XPU build already provides 
 
 This matters more than it first looks. Upstream's own `o_voxel.postprocess.to_glb` imports `nvdiffrast` at the top of the file, so **upstream's standard CUDA export path would fail this test.** This port's own baker is what keeps the output clean. Do not port `nvdiffrast` to XPU later as an improvement, and do not import `trellis2/renderers`, `trellis2_texturing.py` or upstream's `postprocess.py`.
 
+**Status, 2026-11-10.** The texturing pipeline is now ported without importing that file: `texture.py` reuses the image-to-3D pipeline's own methods, `backends/dual_grid.py` replaces the C++ voxeliser of `o_voxel`, and the port's baker replaces `nvdiffrast` there too.
+
 ### Passes, with limits worth knowing
 
 **DINOv3.** It has no non-commercial clause, and it treats output separately from the licensed materials (*"THE DINO MATERIALS AND ANY OUTPUT AND RESULTS THEREFROM"*), so its redistribution and deletion terms apply to the materials and not to your GLBs. Its limits:
@@ -288,7 +290,7 @@ volumes:
 - `patch_mesh_base`: keep the no-ops and correct the comments, because `cumesh` is absent rather than crashing.
 - `patch_sparse_attention`:
   - Add a direct path for one sample with no padded copies.
-  - Reject batches above 1, because the padded path passes no mask and shorter samples would attend to zero padding.
+  - Reject batches above 1, because the padded path passes no mask and shorter samples would attend to zero padding. *Status, 2026-11-10: batches are now accepted, with one attention call per sample instead of a padded batch.*
   - Keep the last dimension contiguous, because the fused backend requires a stride of 1.
 - Delete the unused `install_stubs()` and `backends/stubs.py`.
 
@@ -331,6 +333,8 @@ The `assets/shoe_input.png` inherited from trellis-mac (since removed) is RGB, s
 | Material factors | `metallicFactor=0.0` multiplies the metallic texture to zero | `1.0` and `1.0`, plus `doubleSided=True` |
 | Sampling | KDTree with inverse-distance weighting | Sparse trilinear |
 | Gap filling | Box filter on base colour only | `cv2.inpaint` (Telea) on every channel |
+
+*Status, 2026-11-10: alpha was missing from this table. Upstream writes it into the base colour texture; the baker now does too, and goes further by exporting transparent faces with a blended material (`--alpha-mode`).*
 
 Match upstream's behaviour in each row, but write the code here. Do not import upstream's `postprocess.py`, because it imports `nvdiffrast`.
 

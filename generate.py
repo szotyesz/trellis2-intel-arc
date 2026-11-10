@@ -1,5 +1,8 @@
 """
-Generate a textured 3D mesh from an RGBA image using TRELLIS.2 on an Intel GPU.
+Generate textured 3D meshes from RGBA images using TRELLIS.2 on an Intel GPU.
+
+Several images, or several samples of one, run in one process: the models
+load once and each stage runs for every job before the next stage starts.
 """
 
 import argparse
@@ -50,19 +53,8 @@ def free_ram():
     ctypes.CDLL("libc.so.6").malloc_trim(0)
 
 
-# Models no later stage needs. System RAM, not VRAM, is what runs out here.
-RELEASE_AFTER = {
-    "sample_sparse_structure": ("sparse_structure_flow_model", "sparse_structure_decoder"),
-    "sample_shape_slat": ("shape_slat_flow_model_512", "shape_slat_flow_model_1024"),
-    "sample_shape_slat_cascade": ("shape_slat_flow_model_512", "shape_slat_flow_model_1024"),
-    "sample_tex_slat": ("tex_slat_flow_model_512", "tex_slat_flow_model_1024"),
-    "decode_shape_slat": ("shape_slat_decoder",),
-    "decode_tex_slat": ("tex_slat_decoder",),
-}
-
-
-def instrument_stages(pipeline):
-    """Print peak RAM and VRAM per pipeline stage, and release finished models."""
+def log_stages(pipeline, names):
+    """Print time, peak RAM and peak VRAM for every call of the named stages."""
     peak = [0.0]
 
     def sample():
@@ -80,10 +72,6 @@ def instrument_stages(pipeline):
             torch.xpu.reset_peak_memory_stats()
             t0 = time.time()
             result = fn(*a, **k)
-            if name == "sample_sparse_structure":
-                pipeline.image_cond_model = None
-            for model in RELEASE_AFTER.get(name, ()):
-                pipeline.models.pop(model, None)
             free_ram()
             print(
                 f"[mem] {name}: {time.time() - t0:.0f}s, RAM peak {peak[0]:.1f} now {rss_gib():.1f} GiB, "
@@ -94,16 +82,143 @@ def instrument_stages(pipeline):
 
         setattr(pipeline, name, wrapped)
 
-    for name in ("get_cond", "sample_sparse_structure", "sample_shape_slat", "sample_shape_slat_cascade",
-                 "sample_tex_slat", "decode_shape_slat", "decode_tex_slat"):
+    for name in names:
         wrap(name)
+
+
+def release(pipeline, *models):
+    """Drop models no later stage needs. System RAM, not VRAM, is what runs out here."""
+    for model in models:
+        pipeline.models.pop(model, None)
+    free_ram()
+
+
+def exit_after_gpu_error():
+    print(FAILURE_HELP, file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # A normal exit can hang in the Level Zero runtime after a device error.
+    os._exit(1)
+
+
+class Job:
+    """One mesh to generate: an image, a seed and where the result goes."""
+
+    def __init__(self, image, seed, output):
+        self.image, self.seed, self.output = image, seed, output
+        self.failed = None      # the stage and error that ended this job
+        self.gpu_error = False
+        self.rng = None         # CPU generator state, carried from stage to stage
+
+    def __str__(self):
+        return f"{os.path.basename(self.image)}, seed {self.seed}"
+
+
+def plan_jobs(images, output, output_dir, seed, num_samples):
+    """One job per image and sample. Sample i of an image uses seed + i."""
+    if output and len(images) > 1:
+        raise SystemExit("--output names one result; use --output-dir with several images")
+    jobs = []
+    for image in images:
+        stem = output or os.path.join(output_dir, os.path.splitext(os.path.basename(image))[0])
+        for i in range(num_samples):
+            jobs.append(Job(image, seed + i, stem if num_samples == 1 else f"{stem}_s{seed + i}"))
+    taken = {}
+    for job in jobs:
+        if taken.setdefault(job.output, job.image) != job.image:
+            raise SystemExit(f"{taken[job.output]} and {job.image} would both write {job.output}.glb")
+    return jobs
+
+
+def for_each(jobs, stage, fn):
+    """Run one stage for every job still alive, with each job's own noise.
+
+    A job that fails is dropped and the others carry on, so one image that
+    runs out of memory does not cost the rest of the batch.
+    """
+    for job in jobs:
+        if job.failed:
+            continue
+        if len(jobs) > 1:
+            print(f"--- {stage}: {job}", flush=True)
+        if job.rng is None:
+            torch.manual_seed(job.seed)
+        else:
+            torch.set_rng_state(job.rng)
+        try:
+            fn(job)
+        except Exception as e:
+            traceback.print_exc()
+            job.failed = f"{stage}: {type(e).__name__}"
+            job.gpu_error = isinstance(e, RuntimeError)
+            free_ram()
+        job.rng = torch.get_rng_state()
+
+
+def sample_latents(pipeline, jobs, pipeline_type, max_tokens, overrides):
+    """The sampling stages of upstream's run(), one stage at a time across jobs.
+
+    Each job draws its noise in the order run() does, from a generator
+    seeded with the job's seed, so a job gives the same latents here as
+    alone. Sets job.shape_slat, job.tex_slat and job.res.
+    """
+    models = pipeline.models
+    conds = {}
+
+    def cond(job):
+        if job.image not in conds:
+            image = pipeline.preprocess_image(Image.open(job.image))
+            conds[job.image] = (pipeline.get_cond([image], 512),
+                                pipeline.get_cond([image], 1024) if pipeline_type != "512" else None)
+        job.cond_512, job.cond_1024 = conds[job.image]
+
+    for_each(jobs, "conditioning", cond)
+    pipeline.image_cond_model = None
+    conds.clear()
+    free_ram()
+
+    ss_res = 64 if pipeline_type == "1024" else 32
+
+    def structure(job):
+        job.coords = pipeline.sample_sparse_structure(job.cond_512, ss_res, 1, overrides)
+
+    for_each(jobs, "sparse structure", structure)
+    release(pipeline, "sparse_structure_flow_model", "sparse_structure_decoder")
+
+    def shape(job):
+        if pipeline_type == "512":
+            job.shape_slat = pipeline.sample_shape_slat(job.cond_512, models["shape_slat_flow_model_512"], job.coords, overrides)
+            job.res = 512
+        elif pipeline_type == "1024":
+            job.shape_slat = pipeline.sample_shape_slat(job.cond_1024, models["shape_slat_flow_model_1024"], job.coords, overrides)
+            job.res = 1024
+        else:
+            job.shape_slat, job.res = pipeline.sample_shape_slat_cascade(
+                job.cond_512, job.cond_1024, models["shape_slat_flow_model_512"], models["shape_slat_flow_model_1024"],
+                512, 1024 if pipeline_type == "1024_cascade" else 1536, job.coords, overrides, max_tokens)
+        del job.coords
+
+    for_each(jobs, "shape", shape)
+    release(pipeline, "shape_slat_flow_model_512", "shape_slat_flow_model_1024")
+
+    def texture(job):
+        size = "512" if pipeline_type == "512" else "1024"
+        job.tex_slat = pipeline.sample_tex_slat(job.cond_512 if size == "512" else job.cond_1024,
+                                                models[f"tex_slat_flow_model_{size}"], job.shape_slat, overrides)
+        del job.cond_512, job.cond_1024
+
+    for_each(jobs, "texture", texture)
+    release(pipeline, "tex_slat_flow_model_512", "tex_slat_flow_model_1024")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", help="Input image with a transparent background")
+    parser.add_argument("images", nargs="+", metavar="image", help="Input image with a transparent background; several run as a batch")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", default="/out/output_3d", help="Output path without extension")
+    parser.add_argument("--num-samples", type=int, default=1,
+                        help="Meshes per image. Sample i uses seed + i and is written with a _s<seed> suffix")
+    parser.add_argument("--output", default=None, help="Output path without extension, for one image (default: /out/output_3d)")
+    parser.add_argument("--output-dir", default="/out", help="With several images: each is written here under its own name")
     parser.add_argument("--pipeline-type", default="512", choices=["512", "1024", "1024_cascade", "1536_cascade"])
     parser.add_argument("--max-tokens", type=int, default=49152)
     parser.add_argument("--texture-size", type=int, default=1024, choices=[512, 1024, 2048, 4096])
@@ -115,8 +230,20 @@ def main():
                         help="Non-manifold edge repair: 'pair' keeps sheets connected, which halves the cracks "
                              "simplification opens but makes the UV unwrap take 2-20 minutes; "
                              "'cut' splits every such edge and unwraps in seconds")
+    parser.add_argument("--alpha-mode", default="auto", choices=["auto", "opaque", "blend", "mask"],
+                        help="How the GLB uses the alpha the model predicts: 'blend' draws transparent faces "
+                             "blended, 'mask' cuts them out, 'opaque' stores alpha but ignores it as upstream "
+                             "does, 'auto' blends only when part of the surface is transparent")
     parser.add_argument("--steps", type=int, default=None, help="Override sampler steps for all phases")
     args = parser.parse_args()
+    if args.num_samples < 1:
+        parser.error("--num-samples must be at least 1")
+    if len(args.images) == 1 and not args.output:
+        args.output = "/out/output_3d"
+    jobs = plan_jobs(args.images, args.output, args.output_dir, args.seed, args.num_samples)
+    for image in args.images:
+        if not os.path.isfile(image):
+            parser.error(f"no such image: {image}")
 
     from trellis2.pipelines.trellis2_image_to_3d import Trellis2ImageTo3DPipeline
 
@@ -135,76 +262,69 @@ def main():
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
     pipeline.to(torch.device("xpu"))
     print(f"Loaded in {time.time() - t0:.0f}s on {torch.xpu.get_device_name(0)}, RAM {rss_gib():.1f} GiB")
-    instrument_stages(pipeline)
-
-    overrides = {"steps": args.steps} if args.steps else {}
-    t0 = time.time()
-    try:
-        mesh = pipeline.run(
-            Image.open(args.image),
-            seed=args.seed,
-            pipeline_type=args.pipeline_type,
-            max_num_tokens=args.max_tokens,
-            sparse_structure_sampler_params=overrides,
-            shape_slat_sampler_params=overrides,
-            tex_slat_sampler_params=overrides,
-        )[0]
-    except RuntimeError:
-        print(FAILURE_HELP, file=sys.stderr)
-        traceback.print_exc()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        # A normal exit can hang in the Level Zero runtime after a device error.
-        os._exit(1)
-    print(f"Generated in {time.time() - t0:.1f}s, peak VRAM {torch.xpu.max_memory_allocated() / 2**30:.1f} GiB")
-
-    verts = mesh.vertices.cpu().numpy()
-    faces = mesh.faces.cpu().numpy()
-    print(f"Mesh: {len(verts):,} vertices, {len(faces):,} triangles")
-
-    if args.no_texture or args.save_raw:
-        with open(f"{args.output}.obj", "w") as f:
-            np.savetxt(f, verts, fmt="v %.6f %.6f %.6f")
-            np.savetxt(f, faces + 1, fmt="f %d %d %d")
-        # Everything scripts/bake_raw.py needs to redo the baking without a GPU.
-        np.savez(f"{args.output}.raw.npz", vertices=verts.astype(np.float32), faces=faces.astype(np.int32),
-                 coords=mesh.coords.cpu().numpy(), attrs=mesh.attrs.cpu().float().numpy(),
-                 origin=mesh.origin.cpu().numpy(), voxel_size=np.float32(mesh.voxel_size))
-
-    if args.no_texture:
-        return
-
-    import trimesh
+    log_stages(pipeline, ("get_cond", "sample_sparse_structure", "sample_shape_slat", "sample_shape_slat_cascade",
+                          "sample_tex_slat", "decode_shape_slat", "decode_tex_slat"))
 
     sys.path.insert(0, ROOT)
-    from backends.texture_baker import bake_texture, export_glb_with_texture, simplify_mesh, uv_unwrap
-
-    # Baking runs on the CPU: release the models and the raw GPU mesh first.
-    coords = mesh.coords.cpu().numpy()
-    attrs = mesh.attrs.cpu().float().numpy()
-    origin = mesh.origin.cpu().numpy()
-    voxel_size = mesh.voxel_size
-    del mesh, pipeline
-    free_ram()
-    print(f"RAM before baking: {rss_gib():.1f} GiB")
+    from backends.texture_baker import bake_to_glb
 
     t0 = time.time()
-    bake_verts, bake_faces = simplify_mesh(verts, faces, args.target_faces, voxel_size=voxel_size,
-                                           repair=args.repair, coords=coords, origin=origin)
-    del verts, faces
-    free_ram()
-    print(f"Simplified to {len(bake_faces):,} triangles in {time.time() - t0:.0f}s")
-    normals = trimesh.Trimesh(bake_verts, bake_faces, process=False).vertex_normals
-    t0 = time.time()
-    new_verts, new_faces, uvs, vmapping = uv_unwrap(bake_verts, bake_faces)
-    print(f"Unwrapped in {time.time() - t0:.0f}s")
-    t0 = time.time()
-    base_color, mr, _ = bake_texture(
-        new_verts, new_faces, uvs, coords, attrs, origin, voxel_size,
-        texture_size=args.texture_size,
-    )
-    export_glb_with_texture(new_verts, new_faces, uvs, base_color, mr, f"{args.output}.glb", normals=normals[vmapping])
-    print(f"Baked in {time.time() - t0:.0f}s: {args.output}.glb, RAM {rss_gib():.1f} GiB")
+    with torch.no_grad():
+        sample_latents(pipeline, jobs, args.pipeline_type, args.max_tokens, {"steps": args.steps} if args.steps else {})
+    sampled = time.time() - t0
+    torch.xpu.empty_cache()
+
+    def decode(job):
+        """Decode on the GPU and move what baking needs to the CPU."""
+        t0 = time.time()
+        with torch.no_grad():
+            mesh = pipeline.decode_latent(job.shape_slat, job.tex_slat, job.res)[0]
+        del job.shape_slat, job.tex_slat
+        raw = dict(vertices=mesh.vertices.cpu().numpy(), faces=mesh.faces.cpu().numpy(),
+                   coords=mesh.coords.cpu().numpy(), attrs=mesh.attrs.cpu().float().numpy(),
+                   origin=mesh.origin.cpu().numpy(), voxel_size=float(mesh.voxel_size))
+        # With one job this is the time of the whole GPU phase, as before.
+        print(f"Generated in {time.time() - t0 + sampled / len(jobs):.1f}s, "
+              f"peak VRAM {torch.xpu.max_memory_allocated() / 2**30:.1f} GiB")
+        print(f"Mesh: {len(raw['vertices']):,} vertices, {len(raw['faces']):,} triangles")
+        return raw
+
+    def finish(job):
+        raw = decode(job)
+        if job is alive[-1]:
+            # Baking runs on the CPU: release the decoders before the last one.
+            release(pipeline, "shape_slat_decoder", "tex_slat_decoder")
+        else:
+            free_ram()
+        os.makedirs(os.path.dirname(os.path.abspath(job.output)), exist_ok=True)
+        if args.no_texture or args.save_raw:
+            with open(f"{job.output}.obj", "w") as f:
+                np.savetxt(f, raw["vertices"], fmt="v %.6f %.6f %.6f")
+                np.savetxt(f, raw["faces"] + 1, fmt="f %d %d %d")
+            # Everything scripts/bake_raw.py needs to redo the baking without a GPU.
+            np.savez(f"{job.output}.raw.npz", **{**raw, "vertices": raw["vertices"].astype(np.float32),
+                                                 "faces": raw["faces"].astype(np.int32),
+                                                 "voxel_size": np.float32(raw["voxel_size"])})
+        if args.no_texture:
+            return
+        print(f"RAM before baking: {rss_gib():.1f} GiB")
+        t0 = time.time()
+        mode = bake_to_glb(raw.pop("vertices"), raw.pop("faces"), **raw, output_path=f"{job.output}.glb",
+                           target_faces=args.target_faces, texture_size=args.texture_size, repair=args.repair,
+                           alpha_mode=args.alpha_mode)
+        print(f"Baked in {time.time() - t0:.0f}s: {job.output}.glb, alpha {mode}, RAM {rss_gib():.1f} GiB")
+
+    alive = [job for job in jobs if not job.failed]
+    for_each(jobs, "decode and bake", finish)
+
+    failed = [job for job in jobs if job.failed]
+    if len(jobs) > 1:
+        print(f"Done: {len(jobs) - len(failed)} of {len(jobs)} succeeded")
+    for job in failed:
+        print(f"FAILED {job}: {job.failed}", file=sys.stderr)
+    if any(job.gpu_error for job in failed):
+        exit_after_gpu_error()
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":

@@ -320,3 +320,156 @@ def test_voxel_shell_near_uses_the_neighbouring_cells():
     shell = VoxelShell(np.array([[2, 2, 2]]), origin=np.zeros(3), voxel_size=1.0)
     near = shell.near(np.array([[2.5, 2.5, 2.5], [1.2, 3.8, 2.5], [0.5, 2.5, 2.5], [2.5, 2.5, 4.5]]))
     np.testing.assert_array_equal(near, [True, True, False, False])
+
+
+def test_sparse_attention_handles_several_samples():
+    """Each sample attends only within itself, whatever the lengths."""
+    import torch.nn.functional as F
+    from trellis2.modules.sparse import VarLenTensor
+    from trellis2.modules.sparse.attention.full_attn import sparse_scaled_dot_product_attention as attend
+
+    torch.manual_seed(0)
+    lengths, heads, dim = [5, 9, 2], 2, 8
+    layout = VarLenTensor.layout_from_seqlen(lengths)
+    qkv = VarLenTensor(torch.randn(sum(lengths), 3, heads, dim), layout)
+
+    def dense(q, k, v):
+        return F.scaled_dot_product_attention(*(t.unsqueeze(0).transpose(1, 2) for t in (q, k, v))).transpose(1, 2)[0]
+
+    out = attend(qkv).feats
+    for s in layout:
+        assert torch.allclose(out[s], dense(*qkv.feats[s].unbind(dim=1)), atol=1e-6)
+
+    # Cross-attention to a dense context, as the flow models condition on the image.
+    q = VarLenTensor(torch.randn(sum(lengths), heads, dim), layout)
+    context = torch.randn(len(lengths), 7, 2, heads, dim)
+    out = attend(q, context).feats
+    for i, s in enumerate(layout):
+        assert torch.allclose(out[s], dense(q.feats[s], *context[i].unbind(dim=1)), atol=1e-6)
+
+
+def glass_and_solid(tmp_path, alpha_mode):
+    """A sphere whose upper half has an alpha of 0.3, baked and exported."""
+    baker = load_baker()
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=0.4)
+    res = 64
+    g = np.arange(res)
+    grid = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
+    centers = (grid + 0.5) / res - 0.5
+    shell = np.abs(np.linalg.norm(centers, axis=1) - 0.4) < 3 / res
+    coords, p = grid[shell], centers[shell]
+    alpha = np.where(p[:, 2] > 0, 0.3, 1.0)[:, None]
+    attrs = np.concatenate([color_field(p), np.full((len(p), 2), 0.5), alpha], axis=1).astype(np.float32)
+    v, f, uv, _ = baker.uv_unwrap(np.asarray(mesh.vertices), np.asarray(mesh.faces))
+    bake = baker.bake_texture(v, f, uv, coords, attrs, np.array([-0.5] * 3), 1 / res, texture_size=256)
+    path = tmp_path / f"{alpha_mode}.glb"
+    used = baker.export_glb_with_texture(v, f, uv, bake.base_color, bake.metallic_roughness, str(path),
+                                         alpha_img=bake.alpha, face_alpha=bake.face_alpha, alpha_mode=alpha_mode)
+    return used, path, v, f, bake
+
+
+def gltf_header(path):
+    import json
+    import struct
+
+    data = Path(path).read_bytes()
+    return json.loads(data[20:20 + struct.unpack("<I", data[12:16])[0]])
+
+
+def test_transparent_faces_get_a_blended_material(tmp_path):
+    used, path, v, f, bake = glass_and_solid(tmp_path, "auto")
+    assert used == "blend"
+    upper = v[f].mean(axis=1)[:, 2] > 0.05
+    assert (bake.face_alpha[upper] < 0.5).all() and (bake.face_alpha[v[f].mean(axis=1)[:, 2] < -0.05] > 0.95).all()
+
+    header = gltf_header(path)
+    assert sorted(m["alphaMode"] for m in header["materials"]) == ["BLEND", "OPAQUE"]
+    # Both materials use the same two images, stored once.
+    assert len({i["bufferView"] for i in header["images"]}) == 2
+    scene = trimesh.load(path, process=False)
+    parts = {name: g for name, g in scene.geometry.items()}
+    assert sum(len(g.faces) for g in parts.values()) == len(f)
+    blended = next(g for g in parts.values() if g.visual.material.alphaMode == "BLEND")
+    assert abs(len(blended.faces) / len(f) - 0.5) < 0.1
+    # Y-up after export: the transparent half is the top.
+    assert blended.vertices[:, 1].min() > -0.1
+    texture = np.asarray(blended.visual.material.baseColorTexture)
+    assert texture.shape[2] == 4 and texture[..., 3].min() < 100 and texture[..., 3].max() == 255
+
+
+def test_alpha_modes_follow_the_request(tmp_path):
+    for mode, expected in (("opaque", ["OPAQUE"]), ("mask", ["MASK"])):
+        used, path, *_ = glass_and_solid(tmp_path, mode)
+        header = gltf_header(path)
+        assert used == mode and [m["alphaMode"] for m in header["materials"]] == expected
+    assert header["materials"][0]["alphaCutoff"] == 0.5
+
+
+def test_opaque_surface_stays_opaque_in_auto(tmp_path):
+    baker = load_baker()
+    v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float)
+    f = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
+    assert baker.choose_alpha_mode("auto", v, f, np.array([1.0, 0.99, 0.95, 0.91])) == "opaque"
+    assert baker.choose_alpha_mode("auto", v, f, np.array([1.0, 0.99, 0.95, 0.2])) == "blend"
+    assert baker.choose_alpha_mode("auto", v, f, None) == "opaque"
+
+
+def test_batch_jobs_get_distinct_outputs():
+    import generate
+
+    jobs = generate.plan_jobs(["/input/a.png", "/input/b.webp"], None, "/out", 7, 2)
+    assert [(j.image, j.seed, j.output) for j in jobs] == [
+        ("/input/a.png", 7, "/out/a_s7"), ("/input/a.png", 8, "/out/a_s8"),
+        ("/input/b.webp", 7, "/out/b_s7"), ("/input/b.webp", 8, "/out/b_s8"),
+    ]
+    assert [j.output for j in generate.plan_jobs(["/input/a.png"], "/out/x", "/out", 42, 1)] == ["/out/x"]
+    for bad in (dict(images=["/a/x.png", "/b/x.png"], output=None), dict(images=["/a/x.png", "/a/y.png"], output="/out/z")):
+        try:
+            generate.plan_jobs(bad["images"], bad["output"], "/out", 42, 1)
+        except SystemExit:
+            continue
+        raise AssertionError("clashing outputs must be rejected")
+
+
+def test_jobs_keep_their_own_noise_across_stages():
+    """Interleaved jobs draw the numbers they would draw alone."""
+    import generate
+
+    def alone(seed):
+        torch.manual_seed(seed)
+        return [torch.randn(3) for _ in range(2)]
+
+    jobs = [generate.Job("a.png", 1, "a"), generate.Job("b.png", 2, "b")]
+    drawn = {1: [], 2: []}
+    for stage in ("first", "second"):
+        generate.for_each(jobs, stage, lambda job: drawn[job.seed].append(torch.randn(3)))
+    for seed in (1, 2):
+        assert all(torch.equal(a, b) for a, b in zip(drawn[seed], alone(seed)))
+
+    def boom(job):
+        if job.seed == 1:
+            raise ValueError("bad input")
+        drawn[job.seed].append(None)
+
+    generate.for_each(jobs, "third", boom)
+    assert jobs[0].failed == "third: ValueError" and not jobs[0].gpu_error and jobs[1].failed is None
+    generate.for_each(jobs, "fourth", lambda job: drawn[job.seed].append(None))
+    assert len(drawn[1]) == 2 and len(drawn[2]) == 4
+
+
+def test_texturing_keeps_usable_uvs_and_normalises_the_mesh():
+    import texture
+
+    v = np.array([[2.0, 10.0, -1.0], [4.0, 10.0, -1.0], [2.0, 14.0, 0.0]])
+    unit = texture.normalise(v, z_up=False)
+    assert np.abs(unit).max() <= 0.5 and np.isclose(np.ptp(unit, axis=0).max(), 0.99999)
+    # glTF's up (Y) becomes Z, and its Z becomes -Y, as upstream's preprocess_mesh.
+    assert unit[2, 2] > unit[0, 2] and np.isclose(unit[2, 1], -unit[2, 1].__abs__())
+    assert np.allclose(texture.normalise(v, z_up=True), (v - [3, 12, -0.5]) * 0.99999 / 4)
+
+    mesh = trimesh.Trimesh(v, [[0, 1, 2]], process=False)
+    assert texture.usable_uv(mesh) is None
+    mesh.visual = trimesh.visual.TextureVisuals(uv=[[0, 0], [1, 0], [0, 0.25]])
+    assert np.allclose(texture.usable_uv(mesh), [[0, 1], [1, 1], [0, 0.75]])
+    mesh.visual = trimesh.visual.TextureVisuals(uv=[[0, 0], [3, 0], [0, 1]])
+    assert texture.usable_uv(mesh) is None

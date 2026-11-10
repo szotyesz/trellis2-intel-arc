@@ -10,7 +10,7 @@ from typing import Union
 
 
 def mesh_to_flexible_dual_grid(*args, **kwargs):
-    raise RuntimeError("mesh_to_flexible_dual_grid requires CUDA (o_voxel)")
+    raise RuntimeError("Not in this stub: use backends.dual_grid.mesh_to_flexible_dual_grid, the CPU port")
 
 
 # Static lookup tables (lazily initialized, cached per-device)

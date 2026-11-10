@@ -11,6 +11,7 @@ forbids commercial use.
 """
 
 import time
+from typing import NamedTuple, Optional
 
 import cv2
 import numpy as np
@@ -379,10 +380,12 @@ def _rasterize_uv_triangles(vertices, faces, uvs, texture_size):
     Returns:
         positions: [H, W, 3] 3D position at each texel
         mask: [H, W] bool mask of filled texels
+        face_id: [H, W] index of the triangle that filled each texel, or -1
     """
     H = W = texture_size
     positions = np.zeros((H, W, 3), dtype=np.float32)
     mask = np.zeros((H, W), dtype=bool)
+    face_id = np.full((H, W), -1, dtype=np.int32)
 
     n_faces = len(faces)
     uv_scale = np.array([W - 1, H - 1], dtype=np.float32)
@@ -436,8 +439,9 @@ def _rasterize_uv_triangles(vertices, faces, uvs, texture_size):
         iy, ix = np.where(inside)
         positions[py_range.astype(int)[iy], px_range.astype(int)[ix]] = pos_3d[iy, ix]
         mask[py_range.astype(int)[iy], px_range.astype(int)[ix]] = True
+        face_id[py_range.astype(int)[iy], px_range.astype(int)[ix]] = fi
 
-    return positions, mask
+    return positions, mask, face_id
 
 
 def sample_sparse_trilinear(coords, attrs, query):
@@ -489,15 +493,31 @@ def sample_nearest_voxel(coords, attrs, query, max_distance):
 NEAREST_VOXEL_RADIUS = 3.0
 
 
+# Opaque surfaces decode to an alpha of 0.99 or more, glass to 0.5 or less.
+# A face with a texel below this is drawn blended.
+ALPHA_OPAQUE = 0.9
+# "auto" blends when at least this share of the surface area is transparent.
+AUTO_BLEND_AREA = 0.005
+
+
+class Bake(NamedTuple):
+    base_color: np.ndarray              # [H, W, 3] uint8
+    metallic_roughness: np.ndarray      # [H, W, 3] uint8, glTF packing
+    hit_rate: float                     # share of texels with a voxel to sample trilinearly
+    alpha: Optional[np.ndarray]         # [H, W] uint8, None without an alpha channel
+    face_alpha: Optional[np.ndarray]    # [F] lowest alpha sampled on each face
+
+
 def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_size, texture_size=2048):
     """Bake voxel attributes into textures.
 
     Attribute layout: base colour 0:3, metallic 3, roughness 4, alpha 5.
-    Returns the RGB base colour image, the glTF metallic-roughness image, and
-    the share of covered texels that had a voxel to sample trilinearly.
+    Returns a `Bake`: the RGB base colour image, the glTF metallic-roughness
+    image, the share of covered texels that had a voxel to sample
+    trilinearly, the alpha image and the lowest alpha on each face.
     """
     t0 = time.time()
-    positions, mask = _rasterize_uv_triangles(vertices, faces, uvs, texture_size)
+    positions, mask, face_id = _rasterize_uv_triangles(vertices, faces, uvs, texture_size)
     query = (positions[mask] - np.asarray(origin)) / voxel_size
     voxel_attrs = np.asarray(voxel_attrs)
     sampled, valid = sample_sparse_trilinear(voxel_coords, voxel_attrs, query)
@@ -524,34 +544,129 @@ def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_
 
     # glTF packs roughness in G and metallic in B.
     mr = np.stack([np.zeros_like(metallic), roughness, metallic], axis=-1)
-    return base_color, mr, hit_rate
+    if sampled.shape[1] < 6:
+        return Bake(base_color, mr, hit_rate, None, None)
+
+    alpha = cv2.inpaint(image[..., 5], gaps, 1, cv2.INPAINT_TELEA)
+    # Lowest alpha a face shows: among the texels it owns, and in the
+    # finished image at its corners and centre, which belong to a neighbour
+    # or to the fill when the face is small or on a chart border. Erring
+    # towards transparent is harmless, since a blended face with opaque
+    # texels still draws opaque; an opaque face over glass texels would
+    # draw the glass as a solid speck.
+    face_alpha = np.ones(len(faces), dtype=np.float32)
+    np.minimum.at(face_alpha, face_id[mask][valid], np.clip(sampled[valid, 5], 0, 1))
+    corners = np.asarray(uvs, dtype=np.float32)[np.asarray(faces)]
+    points = np.concatenate([corners, corners.mean(axis=1, keepdims=True)], axis=1) * (texture_size - 1)
+    texel = np.rint(points).astype(np.int64).clip(0, texture_size - 1)
+    face_alpha = np.minimum(face_alpha, alpha[texel[..., 1], texel[..., 0]].min(axis=1) / 255.0)
+    return Bake(base_color, mr, hit_rate, alpha, face_alpha)
 
 
-def export_glb_with_texture(vertices, faces, uvs, base_color_img, mr_img, output_path, normals=None):
-    """Export a textured GLB, converting to glTF's Y-up axes."""
+ALPHA_MODES = ("auto", "opaque", "blend", "mask")
+
+
+def choose_alpha_mode(alpha_mode, vertices, faces, face_alpha):
+    """Resolve "auto": blend when a visible share of the area is transparent."""
+    if face_alpha is None:
+        return "opaque"
+    if alpha_mode != "auto":
+        return alpha_mode
+    tri = np.asarray(vertices, dtype=np.float64)[np.asarray(faces)]
+    area = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    share = area[face_alpha < ALPHA_OPAQUE].sum() / max(area.sum(), 1e-30)
+    return "blend" if share >= AUTO_BLEND_AREA else "opaque"
+
+
+def export_glb_with_texture(vertices, faces, uvs, base_color_img, mr_img, output_path, normals=None,
+                            alpha_img=None, face_alpha=None, alpha_mode="auto", z_up=True):
+    """Export a textured GLB and return the alpha mode used.
+
+    With `z_up` the mesh is in TRELLIS axes and is turned to glTF's Y-up.
+
+    `alpha_img` goes into the alpha channel of the base colour texture, as
+    upstream writes it. Upstream always marks the material opaque, so a
+    viewer ignores it and glass renders as a solid shell. `alpha_mode` says
+    what to do with it here:
+      - "opaque": as upstream.
+      - "blend": faces with transparent texels go into a second primitive
+        with a blended material, and the rest stay opaque, so the solid
+        parts keep writing depth and do not sort against the glass.
+      - "mask": cut out below an alpha of 0.5.
+      - "auto": "blend" if `AUTO_BLEND_AREA` of the surface is transparent,
+        otherwise "opaque".
+    """
     import trimesh
     from PIL import Image
 
     v = np.array(vertices, dtype=np.float32)
-    v[:, 1], v[:, 2] = v[:, 2].copy(), -v[:, 1]
     if normals is not None:
         normals = np.array(normals, dtype=np.float32)
-        normals[:, 1], normals[:, 2] = normals[:, 2].copy(), -normals[:, 1]
+    if z_up:
+        v[:, 1], v[:, 2] = v[:, 2].copy(), -v[:, 1]
+        if normals is not None:
+            normals[:, 1], normals[:, 2] = normals[:, 2].copy(), -normals[:, 1]
+    faces = np.asarray(faces)
 
     # trimesh flips V again on export, so texture row r ends up at glTF v = r / H.
     uv = np.array(uvs, dtype=np.float32)
     uv[:, 1] = 1 - uv[:, 1]
 
-    material = trimesh.visual.material.PBRMaterial(
-        baseColorTexture=Image.fromarray(base_color_img),
-        metallicRoughnessTexture=Image.fromarray(mr_img),
-        metallicFactor=1.0,
-        roughnessFactor=1.0,
-        doubleSided=True,
-    )
-    mesh = trimesh.Trimesh(
-        vertices=v, faces=faces, vertex_normals=normals, process=False,
-        visual=trimesh.visual.TextureVisuals(uv=uv, material=material),
-    )
-    mesh.export(output_path)
-    return output_path
+    if alpha_img is None:
+        face_alpha = None
+    alpha_mode = choose_alpha_mode(alpha_mode, v, faces, face_alpha)
+    color = base_color_img if alpha_img is None else np.dstack([base_color_img, alpha_img])
+    color, mr = Image.fromarray(color), Image.fromarray(mr_img)
+
+    def part(face_mask, mode):
+        material = trimesh.visual.material.PBRMaterial(
+            baseColorTexture=color,
+            metallicRoughnessTexture=mr,
+            metallicFactor=1.0,
+            roughnessFactor=1.0,
+            alphaMode=mode.upper(),
+            alphaCutoff=0.5 if mode == "mask" else None,
+            doubleSided=True,
+        )
+        f = faces if face_mask is None else faces[face_mask]
+        used, f = np.unique(f, return_inverse=True) if face_mask is not None else (slice(None), f)
+        return trimesh.Trimesh(
+            vertices=v[used], faces=f.reshape(-1, 3), process=False,
+            vertex_normals=None if normals is None else normals[used],
+            visual=trimesh.visual.TextureVisuals(uv=uv[used], material=material),
+        )
+
+    see_through = None
+    if alpha_mode == "blend":
+        see_through = face_alpha < ALPHA_OPAQUE
+        if not see_through.any():
+            alpha_mode = "opaque"
+    if alpha_mode != "blend" or see_through.all():
+        part(None, alpha_mode).export(output_path)
+    else:
+        # The two materials hold the same images, which the exporter stores once.
+        scene = trimesh.Scene()
+        scene.add_geometry(part(~see_through, "opaque"), geom_name="opaque")
+        scene.add_geometry(part(see_through, "blend"), geom_name="transparent")
+        scene.export(output_path)
+    return alpha_mode
+
+
+def bake_to_glb(vertices, faces, coords, attrs, origin, voxel_size, output_path, target_faces=200000,
+                texture_size=1024, repair="pair", alpha_mode="auto", log=print):
+    """Simplify, unwrap, bake and export one raw TRELLIS mesh. Returns the alpha mode used."""
+    import trimesh
+
+    t0 = time.time()
+    v, f = simplify_mesh(vertices, faces, target_faces, voxel_size=voxel_size, repair=repair,
+                         coords=coords, origin=origin, log=log)
+    del vertices, faces     # the raw mesh can be gigabytes, and the caller may have let go of it
+    log(f"Simplified to {len(f):,} triangles in {time.time() - t0:.0f}s")
+    normals = trimesh.Trimesh(v, f, process=False).vertex_normals
+    t0 = time.time()
+    v, f, uvs, vmapping = uv_unwrap(v, f)
+    log(f"Unwrapped in {time.time() - t0:.0f}s")
+    bake = bake_texture(v, f, uvs, coords, attrs, origin, voxel_size, texture_size=texture_size)
+    return export_glb_with_texture(v, f, uvs, bake.base_color, bake.metallic_roughness, output_path,
+                                   normals=normals[vmapping], alpha_img=bake.alpha, face_alpha=bake.face_alpha,
+                                   alpha_mode=alpha_mode)
