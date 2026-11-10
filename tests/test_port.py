@@ -257,3 +257,66 @@ def test_sparse_conv_matches_flexgemm_layout():
     x = SparseTensor(feats=feats, coords=coords)
     out = sparse_conv3d_forward(Conv, x).feats
     assert torch.allclose(out, expected, atol=1e-5)
+
+
+def _voxel_shell_of(mesh, pitch, samples=300_000):
+    """Occupied voxels of a mesh surface, in TRELLIS's coords/origin convention."""
+    points = trimesh.sample.sample_surface(mesh, samples)[0]
+    origin = mesh.bounds[0] - pitch
+    coords = np.unique(np.floor((points - origin) / pitch).astype(np.int64), axis=0)
+    return coords, origin
+
+
+def _heightfield(n, height):
+    """A connected grid mesh over [0, 1]^2 with z = height(x, y)."""
+    x, y = np.meshgrid(np.linspace(0, 1, n), np.linspace(0, 1, n), indexing="ij")
+    v = np.stack([x.ravel(), y.ravel(), height(x, y).ravel()], axis=1)
+    i = np.arange(n * n).reshape(n, n)
+    a, b, c, d = i[:-1, :-1].ravel(), i[1:, :-1].ravel(), i[1:, 1:].ravel(), i[:-1, 1:].ravel()
+    return v, np.concatenate([np.stack([a, b, c], 1), np.stack([a, c, d], 1)])
+
+
+def test_shell_decimation_keeps_faces_on_the_shell():
+    """Towers with alleys between them next to a bumpy field. Plain quadric
+    decimation spends the budget on the bumps and fans faces over the
+    alleys; the shell-aware stage keeps the faces on the surface."""
+    baker = load_baker()
+    rng = np.random.default_rng(0)
+    bumps = rng.uniform(0, 0.03, (40, 40))
+
+    def height(x, y):
+        tower = ((x * 8) % 2 < 1.2) & ((y * 8) % 2 < 1.2) & (x < 0.5)
+        field = bumps[np.minimum((x * 40).astype(int), 39), np.minimum((y * 40).astype(int), 39)]
+        return np.where(tower, 0.3, 0.0) + np.where(x >= 0.5, field, 0.0)
+
+    v, f = _heightfield(160, height)
+    pitch = 1 / 128
+    coords, origin = _voxel_shell_of(trimesh.Trimesh(v, f, process=False), pitch)
+    kw = dict(voxel_size=pitch, coords=coords, origin=origin, repair="cut", log=lambda *a: None)
+    vs, fs = baker.simplify_mesh(v, f, 1500, **kw)
+    vp, fp = baker.simplify_mesh(v, f, 1500, shell_decimation=False, **kw)
+    off_shell = baker.off_surface_fraction(vs, fs, coords, origin, pitch)
+    off_plain = baker.off_surface_fraction(vp, fp, coords, origin, pitch)
+    assert len(fs) <= 1600 and len(fp) <= 1600
+    assert off_plain > 0.05, off_plain
+    assert off_shell < 0.01, off_shell
+
+
+def test_shell_decimation_keeps_open_borders():
+    """An open sheet keeps its outline: the border quadrics stop the free
+    in-plane collapses along its edge from eroding it."""
+    from backends.surface_decimate import VoxelShell, decimate_on_shell
+
+    v, f = _heightfield(60, lambda x, y: np.zeros_like(x))
+    coords, origin = _voxel_shell_of(trimesh.Trimesh(v, f, process=False), 1 / 32)
+    nv, nf = decimate_on_shell(v, f, 200, VoxelShell(coords, origin, 1 / 32), log=lambda *a: None)
+    assert len(nf) <= 210
+    assert abs(trimesh.Trimesh(nv, nf, process=False).area - 1.0) < 0.02
+
+
+def test_voxel_shell_near_uses_the_neighbouring_cells():
+    from backends.surface_decimate import VoxelShell
+
+    shell = VoxelShell(np.array([[2, 2, 2]]), origin=np.zeros(3), voxel_size=1.0)
+    near = shell.near(np.array([[2.5, 2.5, 2.5], [1.2, 3.8, 2.5], [0.5, 2.5, 2.5], [2.5, 2.5, 4.5]]))
+    np.testing.assert_array_equal(near, [True, True, False, False])

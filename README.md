@@ -51,7 +51,7 @@ A run can use nearly all of the card's memory, so stop anything else that is usi
 | `--seed` | `42` | Random seed. Results still vary slightly between runs |
 | `--target-faces` | `200000` | Triangles in the GLB |
 | `--texture-size` | `1024` | `512`, `1024`, `2048` or `4096` |
-| `--repair` | `pair` | How non-manifold edges are repaired before baking. `pair` halves the cracks that simplification opens and removes most speckle on cloth and paper, but UV unwrapping takes minutes to an hour instead of seconds. On a few meshes the simplifier stalls on the paired mesh and flattens it; `pair` detects this and falls back to `cut` for that mesh, printing why. `cut` always cuts, for quick previews |
+| `--repair` | `pair` | How non-manifold edges are repaired before baking. `pair` halves the cracks that simplification opens and removes most speckle on cloth and paper, but UV unwrapping takes minutes to an hour instead of seconds. If the simplifier stalls on a paired mesh and flattens it, `pair` falls back to `cut` for that mesh, printing why. `cut` always cuts, for quick previews |
 | `--max-tokens` | `49152` | Upper limit on sparse tokens in cascade pipelines |
 | `--steps` | model default | Sampler steps for all phases |
 | `--no-texture` | off | Write only the raw mesh as OBJ |
@@ -90,7 +90,7 @@ Both take about a second on the GPU. SAM 3 was 848M parameters and about 2 s per
 - **Cracks:** the repair of non-manifold edges cuts the mesh, and simplification then opens the cuts into hairline cracks, which show as speckles on cloth and paper and as small holes at the cascade levels. The default `--repair pair` removes most of them at the price of a slow unwrap; `--repair cut` brings them back together with a fast unwrap. The measurements document records the cause, the fixes that did not work, and the meshes where pairing has to fall back to cutting.
 - **Colour:** output is often darker or less saturated than the input. The cause has not been fully traced; see the measurements.
 - **Transparency:** glass comes out as an opaque shell.
-- **Scenes:** whole rooms and towns only look right from the input's side.
+- **Scenes:** whole rooms and towns only look right from the input's side. The triangle budget is tight for them: at 200,000 triangles the town's facades are a few voxels off the surface over a tenth of their area, which the final decimation stage keeps from turning into triangles that span windows and alleys.
 
 ## How the port works
 
@@ -99,7 +99,7 @@ Both take about a second on the GPU. SAM 3 was 848M parameters and about 2 s per
 | CUDA sparse convolution (FlexGEMM) | `backends/conv_none.py`: a Triton gather-matmul kernel on XPU, a plain PyTorch loop on CPU and as fallback |
 | CUDA mesh extraction (`o_voxel`) | `backends/mesh_extract.py`, plain PyTorch |
 | `nvdiffrast` texture baking | `backends/texture_baker.py`, NumPy and xatlas on the CPU |
-| CuMesh repair and simplification | `backends/texture_baker.py`: vertex clustering for huge meshes, winding repair, non-manifold vertex splitting, `fast_simplification` |
+| CuMesh repair and simplification | `backends/texture_baker.py`: vertex clustering for huge meshes, winding repair, non-manifold vertex splitting, `fast_simplification` to four times the target, then `backends/surface_decimate.py`, a quadric decimator that refuses collapses whose triangles leave the voxel shell |
 | RMBG-2.0 background removal | Removed, because of its non-commercial licence. `scripts/cutout.py` offers SAM 3 and SAM 2 instead |
 
 `patches/xpu_compat.py` patches upstream at image build time and fails the build if an expected line is missing. CPU fallback stays disabled, so a missing XPU operator raises an error rather than silently running slowly. GPU containers run with no network.

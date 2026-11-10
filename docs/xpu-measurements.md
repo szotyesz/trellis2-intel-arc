@@ -216,3 +216,40 @@ The practical measure is the share of face area whose centroid has no occupied v
 | Town `1536_cascade`, 45.6M | 40.8% | 9.6% | cut |
 
 `simplify_mesh` now applies this: with `--repair pair` it decimates the paired mesh and, if more than 3% of the area is off the surface or the decimator stopped more than 10% above the target, decimates the cut mesh as well and keeps the cut result when that lies at least 3 percentage points closer to the surface. On the seven meshes where pairing is sound this costs nothing or one extra decimation of about a minute; on the two where it fails it restores the cut result, with its cracks but on the surface. The generator prints which repair was used and why. The town at `1024` shows that the proxy also measures what pairing cannot fix: a scene with many thin walls loses a tenth of its area to bridging triangles under either repair.
+
+## Update, 2026-11-10
+
+### Bridging triangles: a decimation stage that stays on the shell
+
+The town and the interior lost about a tenth of their area to triangles off the voxel shell under either repair. Measured on the saved town `1024` mesh (25.7M raw triangles) after each step of `simplify_mesh`, as the share of face area whose centroid has no occupied voxel within one voxel (the proxy from the previous section) and, from a KD-tree over the voxel centres, the share more than one and more than three voxels away:
+
+| Step | Faces | Proxy | > 1 voxel | > 3 voxels |
+|---|---|---|---|---|
+| Raw | 25.7M | 0.0% | 0.0% | 0.0% |
+| Clustered at two voxels | 5.65M | 0.0% | 0.0% | 0.0% |
+| Paired repair | 5.65M | 0.0% | 0.0% | 0.0% |
+| First quadric decimation pass | 265K | 10.5% | 17.9% | 4.2% |
+| Second pass and final repair | 194K | 11.3% | 19.5% | 4.1% |
+
+All of it enters in the decimation. The far faces are large, with a median edge of 18 voxels against 7 for the mesh, and of the 4.1% beyond three voxels, 1.6% have all three vertices on the surface and span a window, an arcade or an alley, while 1.9% hang from a few vertices placed off the surface: the eight largest shared one vertex 14.8 voxels out. The rest, 15% of the area between one and three voxels off, is facades approximated by triangles too large for their relief. The loss is a budget effect: decimating the same mesh to 400K faces leaves 0.9% beyond three voxels and 9.4% beyond one, 800K leaves 0.0% and 0.8%, and 1.6M leaves 0.1% beyond one voxel.
+
+Quadric error measures how far a vertex moves from the planes around it and nothing about the triangle between the vertices, so a vertex on a facade slides along it at no cost and the faces fan over the openings, while every collapse in the foliage and the balustrades has a high error and keeps its triangles. The renders show this: at 200K faces the cypresses are still dense and the facades are a few large facets. Rescaling the coordinates to voxel units, which shifts the simplifier's threshold schedule by six orders of magnitude, changed nothing on the final mesh (17.4% beyond one voxel against 17.6%) and made the paired mesh stall and flatten, so the order of collapses is not the lever.
+
+`backends/surface_decimate.py` is the fix: a quadric decimator over a priority queue that refuses any collapse whose new triangles would have a centroid off the shell by the proxy's test, and takes such collapses, in error order, only once no clean collapse is left. The C++ decimator brings the mesh to four times the target first, where its faces still follow the shell, and the Python stage finishes at about 200,000 collapses a minute. Two details matter. The minimiser of each quadric is taken by a pseudo-inverse anchored at the edge midpoint and dropped if it lies more than two edge lengths away, which removes the displaced hub vertices. And every open edge gets a constraint quadric, the plane through the edge perpendicular to its face, weighted by ten times the squared edge length: without it the collapses along a flat sheet's border are free, the borders erode and the cracks between cut sheets open. On the stroller's cut mesh that constraint took the silhouette gap pixels from 2.21% to 0.55%, under the plain decimator's 0.81%; a weight of 100 gained nothing and pushed 5% of the area over a voxel off.
+
+Same repaired meshes, plain decimation against the shell stage, both at the 200,000 target and after the final repair. Gap pixels are the render-based crack measure from the 7 November section:
+
+| Raw mesh | Proxy, plain → shell | > 1 voxel, plain → shell | Gap pixels, plain → shell | Area, plain → shell | Shell stage |
+|---|---|---|---|---|---|
+| Town `1024`, 25.7M, pair | 9.7% → 0.0% | 17.7% → 3.5% | 0.19% → 0.22% | 7.95 → 8.01 | 187 s |
+| Stroller `1024_cascade`, 12.0M, pair | 0.3% → 0.0% | 2.7% → 0.2% | 0.31% → 0.29% | 3.39 → 3.42 | 168 s |
+| Stroller `1024_cascade`, 12.0M, cut | 3.0% → 0.0% | 9.1% → 1.2% | 0.81% → 0.55% | 2.85 → 2.93 | 188 s |
+| Plant `1024_cascade`, 5.5M, pair | 1.1% → 0.0% | 3.9% → 0.0% | 7.78% → 7.95% | 1.58 → 1.61 | 175 s |
+| Fishbowl `512`, 7.3M, pair | 0.3% → 0.0% | 1.4% → 0.0% | 0.00% → 0.00% | 9.64 → 9.68 | 159 s |
+| Typewriter `1024_cascade`, 22.3M, pair | 1.3% → 0.0% | – → 0.5% | 0.10% → 0.10% | 9.19 → 9.24 | 156 s |
+| Town `1536_cascade`, 45.6M, pair | 40.8%, stalled → 0.1% | – → 9.4% | – → 0.17% | – → 8.19 | 202 s |
+| Farmer `1536_cascade`, 54.4M, pair | 14.8%, stalled → 0.0% | – → 12.6% | – → 0.25% | – → 5.81 | 230 s |
+
+The surface area of the 4× intermediate is 8.33 for the town, so the plain result had lost 5% of the area to collapsed detail and gained some back as bridging faces, and the shell result keeps 96% of it. On the two meshes where pairing stalled and the guard fell back to cutting, the C++ decimator reaches the 800K intermediate and the shell stage, which lets interior vertices merge into border vertices, reaches the target, so pairing stands and the fallback is not needed; the guard stays as a safety net. What remains on scenes is relief of one to two voxels that 200,000 triangles cannot follow: 3.5% of the town's area at `1024`, 9 to 13% at `1536_cascade`, where a voxel is smaller. The fewer than 0.1% of collapses that would leave the shell were never needed on any of these meshes. The stage costs about three minutes of CPU per asset and is on whenever `simplify_mesh` gets the voxel coordinates; `shell_decimation=False` restores the plain path.
+
+Baked through `scripts/bake_raw.py`, the town `1024` mesh confirms it where it counts: 98.2% of the texels find a voxel by trilinear sampling and 99.99% within three voxels, against 68.4% and 84.2% in the 8 November benchmark run, and the facades carry their windows, arcades and balconies instead of flat facets with smeared colour. The unwrap took 17 minutes against 27 in that run (a different raw mesh, so indicative only), the simplification 226 s instead of 43 s.

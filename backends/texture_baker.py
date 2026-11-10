@@ -15,6 +15,8 @@ import time
 import cv2
 import numpy as np
 
+from backends.surface_decimate import VoxelShell, decimate_on_shell
+
 
 def orient_faces(vertices, faces):
     """Make face winding consistent, facing outwards, as far as topology allows.
@@ -238,36 +240,31 @@ def off_surface_fraction(vertices, faces, coords, origin, voxel_size):
     A proxy for the texels the baker will miss: faces that bridge a gap or
     span the interior of a solid instead of following the voxel shell.
     """
-    v = np.asarray(vertices, dtype=np.float64)
-    f = np.asarray(faces, dtype=np.int64)
-    c = np.asarray(coords, dtype=np.int64)
-    span = int(c.max()) + 2
+    return _off_surface_fraction(vertices, faces, VoxelShell(coords, origin, voxel_size))
 
-    def key(cells):
-        return (cells[:, 0] * span + cells[:, 1]) * span + cells[:, 2]
 
-    occupied = np.unique(key(c))
-    cell = np.floor((v[f].mean(axis=1) - np.asarray(origin)) / voxel_size).astype(np.int64)
-    hit = np.zeros(len(f), dtype=bool)
-    for d in np.array(np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1])).reshape(3, -1).T:
-        n = cell + d
-        inside = ((n >= 0) & (n < span)).all(axis=1)
-        k = key(n[inside])
-        i = np.minimum(np.searchsorted(occupied, k), len(occupied) - 1)
-        hit[np.flatnonzero(inside)[occupied[i] == k]] = True
-    tri = v[f]
+def _off_surface_fraction(vertices, faces, shell):
+    tri = np.asarray(vertices, dtype=np.float64)[np.asarray(faces, dtype=np.int64)]
     area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
-    return float(area[~hit].sum() / max(area.sum(), 1e-30))
+    return float(area[~shell.near(tri.mean(axis=1))].sum() / max(area.sum(), 1e-30))
 
 
-def _repair_and_decimate(v, f, target, pair):
+# The C++ decimator takes the mesh down to this multiple of the target, where
+# its faces still follow the shell; the shell-aware decimator does the rest.
+SHELL_STAGE_FACTOR = 4
+
+
+def _repair_and_decimate(v, f, target, pair, shell=None, log=print):
     v, f = make_edge_manifold(v, orient_faces(v, f), pair)
-    v, f = _decimate(v, f, target)
-    if len(f) > target * 1.3:
+    stage = target * SHELL_STAGE_FACTOR if shell is not None else target
+    v, f = _decimate(v, f, stage)
+    if len(f) > stage * 1.3:
         # The simplifier keeps boundary edges, so it can stall on meshes with
         # many of them. Cluster the rest of the way.
-        v, f = cluster_vertices(v, f, _mean_edge_length(v, f) * np.sqrt(len(f) / target))
-        v, f = _decimate(v, f, target)
+        v, f = cluster_vertices(v, f, _mean_edge_length(v, f) * np.sqrt(len(f) / stage))
+        v, f = _decimate(v, f, stage)
+    if shell is not None:
+        v, f = decimate_on_shell(v, clean_faces(v, f), target, shell, log=log)
     # Simplification creates new non-manifold edges, and xatlas can take tens
     # of minutes on them. Clean, orient, then repair again before unwrapping.
     f = clean_faces(v, f)
@@ -275,8 +272,19 @@ def _repair_and_decimate(v, f, target, pair):
 
 
 def simplify_mesh(vertices, faces, target, voxel_size=None, max_raw_faces=8_000_000, pair_sheets=False, repair="pair",
-                  coords=None, origin=None, off_surface_limit=0.03, log=print):
+                  coords=None, origin=None, off_surface_limit=0.03, shell_decimation=True, log=print):
     """Repair, then decimate to about `target` faces.
+
+    With `coords`, `origin` and `voxel_size`, and `shell_decimation` on, the
+    C++ decimator stops at four times the target and `decimate_on_shell`
+    finishes: a quadric decimator that refuses collapses whose new faces
+    leave the voxel shell. Plain quadric decimation only measures how far
+    vertices move from their planes, so on a scene it fans large triangles
+    over windows, arcades and alleys at no cost while the foliage keeps its
+    triangles; the town at 1024 lost 11% of its area that way. The shell
+    stage brings that to 0% at the same triangle count, costs about three
+    minutes of CPU, and its border-constraint quadrics leave fewer cracks
+    than the plain decimator.
 
     `repair` says what to do with edges shared by three or more faces, which
     the extractor and vertex clustering both produce:
@@ -312,18 +320,20 @@ def simplify_mesh(vertices, faces, target, voxel_size=None, max_raw_faces=8_000_
         # far more and left a 57M-triangle mesh fragmented, so stop at two.
         base = voxel_size if voxel_size else _mean_edge_length(v, f)
         v, f = cluster_vertices(v, f, base * min(2.0, np.ceil(np.sqrt(len(f) / max_raw_faces))))
+    shell = VoxelShell(coords, origin, voxel_size) if coords is not None and voxel_size is not None else None
+    stage = shell if shell_decimation else None
     if repair != "pair":
-        return _repair_and_decimate(v, f, target, False)
-    vp, fp = _repair_and_decimate(v, f, target, True)
+        return _repair_and_decimate(v, f, target, False, stage, log)
+    vp, fp = _repair_and_decimate(v, f, target, True, stage, log)
     stalled = len(fp) > target * 1.1
-    if coords is None or voxel_size is None:
+    if shell is None:
         return vp, fp
-    off_pair = off_surface_fraction(vp, fp, coords, origin, voxel_size)
+    off_pair = _off_surface_fraction(vp, fp, shell)
     if not stalled and off_pair <= off_surface_limit:
         log(f"Repair: pair, {off_pair:.1%} of the area off the surface")
         return vp, fp
-    vc, fc = _repair_and_decimate(v, f, target, False)
-    off_cut = off_surface_fraction(vc, fc, coords, origin, voxel_size)
+    vc, fc = _repair_and_decimate(v, f, target, False, stage, log)
+    off_cut = _off_surface_fraction(vc, fc, shell)
     why = "stalled at {:,} faces".format(len(fp)) if stalled else f"{off_pair:.1%} of the area off the surface"
     if stalled or off_cut + off_surface_limit < off_pair:
         log(f"Repair: cut, because pairing {why} (cut: {off_cut:.1%} off the surface)")
