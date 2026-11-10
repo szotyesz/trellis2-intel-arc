@@ -317,7 +317,7 @@ Pass criteria:
 - The OBJ looks correct.
 - Stage times are recorded against the README's M4 Pro table.
 
-`assets/shoe_input.png` is RGB, so it needs a manual cut-out or Phase 6E. Upstream also ships 72 `.webp` examples, so use ones with real alpha for later phases.
+The `assets/shoe_input.png` inherited from trellis-mac (since removed) is RGB, so it needs a manual cut-out or Phase 6E. Upstream also ships 72 `.webp` examples, so use ones with real alpha for later phases.
 
 ## Phase 3: Correct GLB output
 

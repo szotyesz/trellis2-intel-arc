@@ -1,4 +1,6 @@
-# XPU measurements
+# TRELLIS.2 on Intel Arc Pro B60: measurements with PyTorch XPU
+
+Timings, VRAM and RAM use, accuracy against the CPU, and what was tried and rejected while porting. The [README](../README.md) has the summary.
 
 Run 2026-11-02 with `scripts/xpu_probe.py` in the `trellis` container: torch 2.15.0+xpu, compute-runtime 26.35, Arc Pro B60.
 

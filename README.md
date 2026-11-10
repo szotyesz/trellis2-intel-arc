@@ -1,12 +1,28 @@
-# TRELLIS.2 on Intel Arc
+# TRELLIS.2 on Intel Arc Pro B60: image-to-3D with PyTorch XPU, no CUDA
 
-Runs [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) image-to-3D generation on an Intel Arc Pro B60 (24 GB) with PyTorch XPU, in Docker. It turns one cut-out image into a textured GLB.
+Run Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) image-to-3D model (`TRELLIS.2-4B`) on an **Intel Arc Pro B60** (24 GB) under Linux, using PyTorch's XPU backend in Docker. No NVIDIA GPU, no CUDA and no oneAPI install on the host. One cut-out image goes in, a textured PBR mesh (GLB) comes out.
 
-This is a fork of [trellis-mac](https://github.com/shivampkumar/trellis-mac). The Mac and Metal paths have been removed.
+![Input image and three views of the mesh TRELLIS.2 generated from it on an Intel Arc Pro B60](assets/machine_1024_cascade.jpg)
+
+*Input (left, one of upstream's example images) and the GLB generated at `1024_cascade` on the B60, rendered from three sides.*
+
+Upstream TRELLIS.2 runs only on NVIDIA cards: it calls `.cuda()` directly and depends on the CUDA extensions `flex_gemm`, `o_voxel`, `cumesh`, `nvdiffrast` and `flash_attn`. This port replaces each of them, so the whole image-to-3D pipeline runs on an Intel GPU through `torch.xpu`.
+
+| | |
+|---|---|
+| Tested GPU | Intel Arc Pro B60, 24 GB, `xe` driver. Other Arc cards (B580, B570, A770) are untested; see the [FAQ](#faq) |
+| Stack | `torch 2.15.0+xpu`, `triton-xpu`, compute-runtime 26.35, Level Zero 1.32, in an Ubuntu 24.04 container |
+| Pipelines | `512`, `1024`, `1024_cascade`, `1536_cascade`: all 12 benchmark inputs complete at every level |
+| Time on the GPU | Median 30 s at `512`, 100 s at `1024` and `1024_cascade`, 300 s at `1536_cascade`, plus CPU post-processing |
+| Peak VRAM | 2.6–4.6 GiB at `512`, up to about 20 GiB at the higher levels |
+| Output | GLB with 200,000 triangles, base colour and metallic-roughness textures |
+| Not ported | Upstream's texturing pipeline, Gradio app, video rendering and training |
+
+This started as a fork of [trellis-mac](https://github.com/shivampkumar/trellis-mac), the Apple Silicon port. The Mac and Metal paths have been removed.
 
 ## Requirements
 
-- Linux host with an Intel Arc GPU and the `xe` driver. Only the B60 has been tested.
+- Linux host with an Intel Arc GPU and the `xe` kernel driver. Only the Arc Pro B60 has been tested. The host needs no oneAPI, Level Zero or PyTorch install: the image carries the whole user-space GPU stack.
 - Docker with Compose.
 - 30 GB of system RAM has been enough; a run peaks at about 17 GiB, and the container is capped at 26 GiB.
 - Disk space for the model weights.
@@ -94,10 +110,31 @@ Generation on the GPU takes a median of about 30 s at `512`, 100 s at `1024` and
 - **Transparency:** glass comes out as an opaque shell.
 - **Scenes:** whole rooms and towns only look right from the input's side. The triangle budget is tight for them: at 200,000 triangles the town's facades are a few voxels off the surface over a tenth of their area, which the final decimation stage keeps from turning into triangles that span windows and alleys.
 
+## FAQ
+
+**Does it run on an Arc B580, B570 or A770?** Untested. Nothing in the code is specific to the B60: it needs a GPU that PyTorch exposes as `xpu`. Going by the measured peaks, `512` (2.6–4.6 GiB) should fit a 12 GB card, while the higher levels reached 16–20 GiB on heavy inputs. Please open an issue with your result either way.
+
+**Do I need CUDA, an NVIDIA card or oneAPI?** No. The container installs Intel's compute runtime, Level Zero and the XPU build of PyTorch. The host only provides the kernel driver and `/dev/dri`.
+
+**Upstream fails with `AssertionError: Torch not compiled with CUDA enabled`, or cannot build `flex_gemm`, `cumesh`, `nvdiffrast` or `flash_attn`.** That is what this port fixes: those packages are CUDA-only, and the table below lists what stands in for each.
+
+**`torch.xpu.is_available()` is false in the container.** Check that `/dev/dri` exists on the host and that `VIDEO_GID` and `RENDER_GID` match `getent group video render`. Then run `docker compose run --rm trellis /opt/venv/bin/python scripts/xpu_probe.py`, which reports the device, its memory and any missing operator.
+
+**`torch.OutOfMemoryError: XPU out of memory` or `UR_RESULT_ERROR_OUT_OF_RESOURCES`.** Stop anything else that is using the GPU and try a lower `--pipeline-type`. `generate.py` already sets `PYTORCH_ALLOC_CONF=expandable_segments:True`, which cured the fragmentation failures seen on 24 GB.
+
+**Why does a run take ten minutes when generation takes one or two?** UV unwrapping on the CPU, with the default `--repair pair`. Use `--repair cut` for quick previews.
+
+**Windows, WSL2 or ComfyUI?** Untested and not provided. This is a command-line tool in a Linux container.
+
+**The first TRELLIS, or text-to-3D?** No, only TRELLIS.2 image-to-3D.
+
+**Apple Silicon or AMD?** See [trellis-mac](https://github.com/shivampkumar/trellis-mac) for Macs. This repository has no ROCm path.
+
 ## How the port works
 
 | Upstream needs | Here |
 |---|---|
+| `flash_attn` or `xformers` attention | PyTorch's `scaled_dot_product_attention`, which XPU runs with oneDNN's fused kernel; memory grows linearly with tokens in bf16 and fp16 |
 | CUDA sparse convolution (FlexGEMM) | `backends/conv_none.py`: a Triton gather-matmul kernel on XPU, a plain PyTorch loop on CPU and as fallback |
 | CUDA mesh extraction (`o_voxel`) | `backends/mesh_extract.py`, plain PyTorch |
 | `nvdiffrast` texture baking | `backends/texture_baker.py`, NumPy and xatlas on the CPU |

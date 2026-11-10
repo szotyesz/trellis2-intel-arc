@@ -1,7 +1,9 @@
 [project]
 name = "trellis-xpu"
 version = "0.1.0"
-description = "TRELLIS.2 image-to-3D generation for Intel Arc GPUs (XPU)"
+description = "TRELLIS.2 image-to-3D on Intel Arc GPUs (Arc Pro B60) with PyTorch XPU, without CUDA"
+readme = "README.md"
+keywords = ["trellis", "trellis2", "image-to-3d", "3d-generation", "intel-arc", "arc-pro-b60", "battlemage", "xpu", "pytorch", "level-zero", "sycl", "triton", "docker"]
 requires-python = ">=3.11"
 license = { text = "MIT" }
 
