@@ -1,5 +1,5 @@
 [project]
-name = "trellis-xpu"
+name = "trellis2-intel-arc"
 version = "0.1.0"
 description = "TRELLIS.2 image-to-3D on Intel Arc GPUs (Arc Pro B60) with PyTorch XPU, without CUDA"
 readme = "README.md"
