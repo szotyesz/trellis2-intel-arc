@@ -5,7 +5,8 @@ services:
     image: trellis-xpu:dev
     network_mode: none
     devices: ["/dev/dri:/dev/dri"]
-    group_add: ["983", "987"]   # host video and render
+    # Host video and render group IDs: `getent group video render`.
+    group_add: ["${VIDEO_GID:-983}", "${RENDER_GID:-987}"]
     ipc: host
     mem_limit: 26g          # fail this job, not the host
     memswap_limit: 26g

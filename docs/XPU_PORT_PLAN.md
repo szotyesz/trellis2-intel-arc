@@ -1,6 +1,6 @@
 # Port TRELLIS.2 to the Intel Arc Pro B60 (XPU)
 
-**Status:** plan only, nothing implemented. Researched 2026-11-02. Licensing notes are engineering research, not legal advice.
+**Status:** implemented. This is the plan as researched on 2026-11-02, kept as the design record. Where the work went differently a status note says so, and the results are in [xpu-measurements.md](xpu-measurements.md). Licensing notes are engineering research, not legal advice.
 
 **Sources read:** TRELLIS.2 `75fbf01`, FlexGEMM `6dd94a8`, torch `v2.15.0`, torch-xpu-ops `1dda266` (the commit torch 2.15.0 pins), oneDNN `main` (torch pins `v3.13.3`).
 
@@ -26,7 +26,7 @@ First results should need almost no kernel work. The XPU build already provides 
 | `flex_gemm` `grid_sample_3d` | Small sparse trilinear function (Phase 3) | No |
 | `nvdiffrast` | Existing NumPy UV rasteriser in `texture_baker.py` | No |
 | `cumesh` | `fast_simplification` and `xatlas`; hole filling is deferred to Phase 6 | No |
-| RMBG-2.0 background removal | **Patched out.** Input is RGBA by default; optional BiRefNet in Phase 6E | No |
+| RMBG-2.0 background removal | **Patched out.** Input is RGBA; `scripts/cutout.py` cuts photos out with SAM 2 or SAM 3 (Phase 6E) | No |
 
 ## Licensing
 
@@ -40,7 +40,7 @@ First results should need almost no kernel work. The XPU build already provides 
 | GPU stack in the image: compute-runtime, IGC, gmmlib, Level Zero | MIT | No | Used |
 | 21 Intel runtime packages (`intel-sycl-rt`, `mkl`, ...) | Intel EULA and Simplified Software License | No, but it limits hosted services (below) | Used |
 | FlexGEMM | MIT | No | Phase 6A only |
-| BiRefNet | MIT weights | Not by its licence, but see its training data (below) | **Off by default,** Phase 6E |
+| BiRefNet | MIT weights | Not by its licence, but see its training data (below) | **Out,** see Phase 6E |
 | **RMBG-2.0** | CC BY-NC 4.0 | **Yes** | **Out** |
 | **`nvdiffrast`, `nvdiffrec`** | NVIDIA source licence | **Yes** | **Out** |
 
@@ -76,7 +76,7 @@ The weights stay in a Docker volume and are never committed or baked into an ima
 
 I found no statement on whether non-commercial objects were excluded. Those terms bind whoever used the datasets, not you, and whether they reach a model's output is unsettled law that affects generative models generally. No engineering step changes this. If the commercial stakes are high, have counsel look at it.
 
-**BiRefNet.** The weights are MIT, so it passes the licence test. Its card says it was trained on DIS-TR, part of DIS5K, whose terms state: *"Without permission from the original authors, commercial use of this dataset is prohibited even after copying, editing, processing or any operations of this database."* This is the same category as the note above, but the wording explicitly claims to reach processed forms, and the component is optional, so the plan leaves it off by default. Whether to enable it is the owner's call.
+**BiRefNet.** The weights are MIT, so it passes the licence test. Its card says it was trained on DIS-TR, part of DIS5K, whose terms state: *"Without permission from the original authors, commercial use of this dataset is prohibited even after copying, editing, processing or any operations of this database."* This is the same category as the note above, but the wording explicitly claims to reach processed forms, and the component is optional, so it was left out. Phase 6E records what replaced it.
 
 ### Rules for the implementer
 
@@ -131,9 +131,9 @@ Everything was developed and measured on one host.
   | 1.58M (estimated 1024 top level, 4× the 512 figure) | 15.6 s, 2174 MiB | 1.33 s, 187 MiB |
   | 6.32M | not run | 6.51 s, 665 MiB |
 
-### Not verified
+### Not verified at planning time
 
-Nothing has been built or run yet, so every runtime statement above comes from reading source. Still open:
+Nothing had been built or run when this plan was written, so every runtime statement above came from reading source. The open questions were:
 
 - whether `torch.xpu` initialises with this image's GPU stack on the host kernel
 - whether oneDNN selects its micro kernel for bf16
@@ -141,11 +141,13 @@ Nothing has been built or run yet, so every runtime statement above comes from r
 - whether `transformers` needs `accelerate` for DINOv3 (it was left out)
 - all timings
 
+The Phase 1 probe and the pipeline runs answered them; see the measurements.
+
 ## Prerequisites
 
 Request access to `facebook/dinov3-vitl16-pretrain-lvd1689m` and put a Hugging Face read token in `.secrets/hf_token` (gitignored, mode 600). Accepting the gate is agreeing to its licence, so read the end-use clause above first. The gate is reviewed manually and blocks every real run. RMBG-2.0 access is not needed and should not be requested.
 
-**Defaults assumed:** this fork becomes XPU-only and Docker-only, with the Metal code removed. Input is RGBA unless BiRefNet is explicitly enabled.
+**Defaults assumed:** this fork becomes XPU-only and Docker-only, with the Metal code removed. Input is RGBA.
 
 ## Sharing the GPU
 
@@ -185,7 +187,7 @@ uv pip compile requirements-xpu.in \
 - This exact command resolved successfully without `--generate-hashes`.
 - The hashes matter, because `unsafe-best-match` would otherwise accept a package from either index.
 - Install from the lock with `--require-hashes`.
-- `transformers` is pinned for reproducibility. The DINOv3 patch handles both the 4.57 and 5.x layouts.
+- `transformers` is pinned for reproducibility. The DINOv3 patch handles both the 4.57 and 5.x layouts. It later moved to 5.22.2 for SAM 3.
 - OpenCV stays below 5 to avoid a new major version for one `cv2.inpaint` call. It resolves to 4.14.0.94.
 - `torchaudio`, `utils3d`, `accelerate` and `imageio` are left out because nothing on this path was found to use them. Add one back only if a run proves it necessary.
 
@@ -213,7 +215,7 @@ services:
     image: trellis-xpu:dev
     network_mode: none
     devices: ["/dev/dri:/dev/dri"]
-    group_add: ["983", "987"]   # host video and render
+    group_add: ["983", "987"]   # host video and render: getent group video render
     ipc: host
     cap_add: [IPC_LOCK]
     ulimits: { memlock: { soft: -1, hard: -1 } }
@@ -246,7 +248,7 @@ volumes:
 
 - Fail if `nvdiffrast` or `nvdiffrec` is installed.
 - Fail if any installed package's licence metadata mentions non-commercial, research-only or evaluation-only use. Today nothing in the lock does.
-- Write an inventory of every package and licence to `docs/third-party-licenses.txt`, so a change shows up in review.
+- Print an inventory of every package and licence. The Dockerfile saves it in the image as `/opt/app/third-party-licenses.txt`.
 
 **`scripts/fetch_weights.py`** downloads the three repos below at their default revision, confirms each commit matches, and fails if the cache contains `models--briaai*`:
 
@@ -376,7 +378,7 @@ Match upstream's behaviour in each row, but write the code here. Do not import u
 
 Use the Phase 5 stage profile. Do not start any of these from intuition.
 
-**Status, 2026-11-06.** 6A was done differently from the plan below: not by porting FlexGEMM, but with one Triton gather-matmul kernel inside `conv_none.py` (see `docs/xpu-measurements.md`). It did not meet the 2× gate on generation time, because the flow transformers dominate and the loop was already chunked; it was kept because decoding runs about twice as fast and needs no per-slot temporaries. Its cost is `g++` and `libze-dev` in the image. 6B and 6C were not needed. 6D remains open. 6E still awaits the owner's decision.
+**Status, 2026-11-06.** 6A was done differently from the plan below: not by porting FlexGEMM, but with one Triton gather-matmul kernel inside `conv_none.py` (see `docs/xpu-measurements.md`). It did not meet the 2× gate on generation time, because the flow transformers dominate and the loop was already chunked; it was kept because decoding runs about twice as fast and needs no per-slot temporaries. Its cost is `g++` and `libze-dev` in the image. 6B and 6C were not needed. 6D remains open: filling the extractor's small holes was measured and changed nothing downstream. 6E was done with other models: BiRefNet was rejected over its training data, and `scripts/cutout.py` uses SAM 3 for named objects and SAM 2 otherwise.
 
 **A. FlexGEMM Triton kernels (MIT).** Consider this only if decoders exceed 25% of end-to-end time at the target resolution. Timebox it to one day. Required changes, from reading the source:
 
@@ -400,7 +402,7 @@ Use the Phase 5 stage profile. Do not start any of these from intuition.
 
 **D. Hole filling.** `fill_holes` is a no-op on this path, so meshes may have small holes. If they are visible, add a CPU step limited to upstream's `max_hole_perimeter=3e-2`. Check the library's terms against the licensing test first. Do not port CuMesh.
 
-**E. Opt-in background removal.** Do this when RGB input is wanted and the owner has decided to accept BiRefNet's training-data question. It does not depend on the stage profile.
+**E. Opt-in background removal.** Not done as written below: BiRefNet's training-data question was not accepted, and `scripts/cutout.py` with SAM 2 and SAM 3 is a separate step instead of a `--remove-background` flag. The original plan was to do this when RGB input is wanted and the training-data question is accepted. It does not depend on the stage profile.
 
 - Add `--remove-background`. Without it, RGB input keeps raising the clear error from Phase 2.
 - Load `ZhengPeng7/BiRefNet` at commit `e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4`, fetched only by `fetch-weights --with-remover`. Its custom code runs through `trust_remote_code`, so the pinned commit matters.

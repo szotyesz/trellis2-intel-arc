@@ -30,7 +30,7 @@ For SAM 3 background removal, fetch its weights too, after accepting Meta's lice
 docker compose run --rm fetch-weights /opt/venv/bin/python scripts/fetch_weights.py --with sam3
 ```
 
-`compose.yaml` sets the host's `video` and `render` group IDs (`983`, `987`). Change them if yours differ: `getent group video render`.
+The container needs the host's `video` and `render` group IDs to open the GPU. `compose.yaml` defaults to `983` and `987`; check yours with `getent group video render` and, if they differ, set `VIDEO_GID` and `RENDER_GID` in the environment or in a `.env` file next to `compose.yaml`.
 
 ## Generate
 
@@ -80,7 +80,9 @@ Both take about a second on the GPU. SAM 3 was 848M parameters and about 2 s per
 
 ## Choosing a pipeline type
 
-`1024_cascade` is the best balance for solid objects, at about 5 minutes per image. `512` takes about 2 minutes and is the fallback for anything that fails. `1536_cascade` takes 2–3 times longer than `1024_cascade` and shows little extra detail once baked to 200,000 triangles. Measurements are in [docs/xpu-measurements.md](docs/xpu-measurements.md).
+`1024_cascade` is the best balance for solid objects. `512` is the fallback for anything that fails. `1536_cascade` shows little extra detail once baked to 200,000 triangles.
+
+Generation on the GPU takes a median of about 30 s at `512`, 100 s at `1024` and `1024_cascade`, and 300 s at `1536_cascade`. The CPU steps after it usually take longer: with the default `--repair pair` a whole run took a median of 11–12 minutes at every level on the 12 benchmark inputs, from 2 minutes to over an hour, nearly all of it UV unwrapping. `--repair cut` brings a run back to a few minutes. Measurements are in [docs/xpu-measurements.md](docs/xpu-measurements.md).
 
 ## Limitations
 
@@ -108,7 +110,7 @@ The design and its reasoning are in [docs/XPU_PORT_PLAN.md](docs/XPU_PORT_PLAN.m
 
 ## Licences and commercial use
 
-The port's own code is MIT. The goal is that nothing in the default pipeline prohibits commercial use of the generated output. `scripts/check_licenses.py` checks the installed packages. This is an engineering summary, not legal advice.
+The port's own code is MIT. The goal is that nothing in the default pipeline prohibits commercial use of the generated output. `scripts/check_licenses.py` checks the installed packages at build time and the image keeps its inventory in `/opt/app/third-party-licenses.txt`. This is an engineering summary, not legal advice.
 
 - **TRELLIS.2 code and weights:** [MIT](https://github.com/microsoft/TRELLIS.2/blob/main/LICENSE). A residual risk remains around the data the model was trained on.
 - **DINOv3 weights:** [Meta's custom licence](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/blob/main/LICENSE.md), gated and with end-use restrictions. Review it before commercial use.

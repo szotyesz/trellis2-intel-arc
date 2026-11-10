@@ -9,3 +9,5 @@ TRELLIS.2/
 docs/
 assets/
 **/__pycache__
+scripts/gpu-session.sh
+benchmark/

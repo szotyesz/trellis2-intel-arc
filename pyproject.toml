@@ -5,18 +5,24 @@ description = "TRELLIS.2 image-to-3D generation for Intel Arc GPUs (XPU)"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 
+# Metadata only: the project runs in the Docker image, which installs the
+# hashed requirements-xpu.lock compiled from requirements-xpu.in and clones
+# and patches TRELLIS.2. Keep this list in step with requirements-xpu.in.
 dependencies = [
     "torch==2.15.0",
-    "torchvision",
-    "transformers",
-    "huggingface_hub",
+    "torchvision==0.29.1",
+    "transformers==5.22.2",
     "safetensors",
     "pillow",
     "numpy",
     "trimesh",
     "scipy",
     "tqdm",
+    "easydict",
+    "opencv-python-headless<5",
+    "xatlas",
+    "fast-simplification",
 ]
 
-[project.scripts]
-trellis-generate = "generate:main"
+[project.optional-dependencies]
+test = ["pytest"]

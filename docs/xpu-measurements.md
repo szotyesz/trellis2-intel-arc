@@ -41,7 +41,7 @@ Measured 2026-11-03 and 04 on one machine with 12 inputs, seed 42. Total is wall
 | `1024_cascade` | 7/12 | 5.0 (2.1–7.9) | 81 | 7.9 | 10.1 |
 | `1536_cascade` | 4/12 | 6.4 (3.3–10.6) | 176 | 12.0 | 16.1 |
 
-This matrix ran **before** the GPU memory fixes below, so its completion counts are out of date. It needs repeating. Peak system RAM was about 17 GiB at every level.
+This matrix ran **before** the GPU memory and baking fixes below, so its completion counts and totals are out of date. The repeat on the fixed code is in the 2026-11-08 update. Peak system RAM was about 17 GiB at every level.
 
 Same-seed runs are not identical: one input gave 3.01M and 3.08M raw triangles in two runs.
 
@@ -77,7 +77,8 @@ Output is often darker or less saturated than the input, and differs between lev
 
 - **Baking is not the cause by inspection.** The channel layout, value scaling and inpainting match upstream's `to_glb`, with no gamma step in either.
 - **XPU sampling is not the cause.** From identical inputs and noise at 512, XPU and CPU texture latents differ by a mean of 0.0064 against a latent standard deviation of 2.66 (0.24%).
-- **Not yet tested:** decoder output on XPU against CPU (the CPU decode ran out of RAM in the test container), `conv_none` against upstream's FlexGEMM, and DINOv3 features on XPU against CPU.
+- **The XPU decoders and DINOv3 are not the cause.** On one input at 512 (4 November), DINOv3 features on XPU and CPU differ by a mean of 7e-7 against a feature standard deviation of 1.0, and the decoded voxel attributes by a mean of 0.00014 (maximum 0.0018) on identical coordinates. Both devices decode a mean colour of (0.375, 0.316, 0.168) from an input whose mean is (0.541, 0.487, 0.319), so the darkening is in what the model predicts, not in this port's kernels.
+- **Not yet tested:** `conv_none` against upstream's FlexGEMM on real weights; the comparison above runs the same `conv_none` on both devices.
 - **Possibly expected:** the model predicts PBR base colour, which removes lighting, so some darkening may be normal. A reference run of upstream on CUDA would settle this.
 
 ## Update, 2026-11-06
@@ -216,6 +217,21 @@ The practical measure is the share of face area whose centroid has no occupied v
 | Town `1536_cascade`, 45.6M | 40.8% | 9.6% | cut |
 
 `simplify_mesh` now applies this: with `--repair pair` it decimates the paired mesh and, if more than 3% of the area is off the surface or the decimator stopped more than 10% above the target, decimates the cut mesh as well and keeps the cut result when that lies at least 3 percentage points closer to the surface. On the seven meshes where pairing is sound this costs nothing or one extra decimation of about a minute; on the two where it fails it restores the cut result, with its cracks but on the surface. The generator prints which repair was used and why. The town at `1024` shows that the proxy also measures what pairing cannot fix: a scene with many thin walls loses a tenth of its area to bridging triangles under either repair.
+
+## Update, 2026-11-08
+
+### Pipeline runs, repeated
+
+The matrix from 3 and 4 November again on the fixed code: the same 12 inputs, seed 42, 200,000-triangle target, 1024 px texture, `--repair pair`, with the int32 fix and the off-surface guard but before the shell decimation stage of 10 November, which adds about three minutes per run. Median (range) across inputs; total is wall time for one image in a fresh container.
+
+| Type | Completed | Total, min | Generate, s | Peak VRAM, GiB | Peak RAM, GiB | Raw triangles, M |
+|---|---|---|---|---|---|---|
+| `512` | 12/12 | 12.4 (1.8–64.4) | 31 (23–50) | 2.6 (2.6–4.6) | 14.0 (13.9–14.3) | 3.4 (1.0–7.5) |
+| `1024` | 12/12 | 11.6 (2.1–65.1) | 98 (40–357) | 7.2 (2.7–19.3) | 14.5 (14.3–19.3) | 12.9 (3.1–38.2) |
+| `1024_cascade` | 12/12 | 11.4 (2.3–40.9) | 108 (47–326) | 7.4 (2.9–16.6) | 16.9 (16.7–17.0) | 14.9 (3.5–33.6) |
+| `1536_cascade` | 12/12 | 11.2 (3.1–26.7) | 299 (93–452) | 15.1 (5.3–19.6) | 17.0 (16.9–19.6) | 29.6 (8.6–47.2) |
+
+Every run completes. Generation time is what it was; the totals are now dominated by UV unwrapping of the paired mesh, which took 10 hours across the matrix against 30 minutes with the cut repair, and over an hour on the town at `512` and the fishbowl at `1024`. Every final mesh has 190,000–202,000 triangles. Same-seed runs still differ: the machine at `512` gave 3.17M, 3.66M and 3.90M raw triangles in three runs.
 
 ## Update, 2026-11-10
 
