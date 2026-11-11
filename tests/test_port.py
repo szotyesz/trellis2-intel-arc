@@ -431,6 +431,24 @@ def test_batch_jobs_get_distinct_outputs():
         raise AssertionError("clashing outputs must be rejected")
 
 
+def test_raw_only_writes_the_bake_input_and_nothing_else(tmp_path):
+    """`--raw-only` leaves just the .raw.npz that scripts/bake_raw.py reads."""
+    import generate
+
+    raw = dict(vertices=np.random.rand(5, 3), faces=np.array([[0, 1, 2], [2, 3, 4]]),
+               coords=np.zeros((2, 3), np.int32), attrs=np.ones((2, 6), np.float32),
+               origin=np.zeros(3, np.float32), voxel_size=1 / 1024)
+    generate.save_raw(raw, str(tmp_path / "a"), obj=False)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.raw.npz"]
+    d = np.load(tmp_path / "a.raw.npz")
+    assert d["vertices"].dtype == np.float32 and d["faces"].dtype == np.int32
+    assert np.allclose(d["vertices"], raw["vertices"]) and (d["faces"] == raw["faces"]).all()
+    assert float(d["voxel_size"]) == np.float32(1 / 1024)
+    generate.save_raw(raw, str(tmp_path / "b"), obj=True)
+    assert len((tmp_path / "b.obj").read_text().splitlines()) == 5 + 2
+    assert (tmp_path / "b.raw.npz").exists() and not list(tmp_path.glob("*.tmp.npz"))
+
+
 def test_jobs_keep_their_own_noise_across_stages():
     """Interleaved jobs draw the numbers they would draw alone."""
     import generate

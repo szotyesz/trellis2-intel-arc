@@ -114,6 +114,20 @@ class Job:
         return f"{os.path.basename(self.image)}, seed {self.seed}"
 
 
+def save_raw(raw, stem, obj=True):
+    """Write what scripts/bake_raw.py needs to bake without a GPU, and optionally the OBJ."""
+    if obj:
+        with open(f"{stem}.obj", "w") as f:
+            np.savetxt(f, raw["vertices"], fmt="v %.6f %.6f %.6f")
+            np.savetxt(f, raw["faces"] + 1, fmt="f %d %d %d")
+    # Written under a temporary name, so a reader never sees half a file.
+    tmp = f"{stem}.raw.tmp.npz"
+    np.savez(tmp, **{**raw, "vertices": raw["vertices"].astype(np.float32),
+                     "faces": raw["faces"].astype(np.int32),
+                     "voxel_size": np.float32(raw["voxel_size"])})
+    os.replace(tmp, f"{stem}.raw.npz")
+
+
 def plan_jobs(images, output, output_dir, seed, num_samples):
     """One job per image and sample. Sample i of an image uses seed + i."""
     if output and len(images) > 1:
@@ -225,6 +239,9 @@ def main():
     parser.add_argument("--no-texture", action="store_true", help="Export the raw mesh as OBJ only")
     parser.add_argument("--save-raw", action="store_true",
                         help="Also write the raw mesh as OBJ (hundreds of MB) and a .raw.npz for scripts/bake_raw.py")
+    parser.add_argument("--raw-only", action="store_true",
+                        help="Write only the .raw.npz for scripts/bake_raw.py and exit: no OBJ, no baking, "
+                             "so the GPU is free before the CPU work starts")
     parser.add_argument("--target-faces", type=int, default=200000, help="Triangles in the final GLB")
     parser.add_argument("--repair", default="pair", choices=["cut", "pair"],
                         help="Non-manifold edge repair: 'pair' keeps sheets connected, which halves the cracks "
@@ -297,14 +314,12 @@ def main():
         else:
             free_ram()
         os.makedirs(os.path.dirname(os.path.abspath(job.output)), exist_ok=True)
+        if args.raw_only:
+            save_raw(raw, job.output, obj=False)
+            print(f"Wrote {job.output}.raw.npz")
+            return
         if args.no_texture or args.save_raw:
-            with open(f"{job.output}.obj", "w") as f:
-                np.savetxt(f, raw["vertices"], fmt="v %.6f %.6f %.6f")
-                np.savetxt(f, raw["faces"] + 1, fmt="f %d %d %d")
-            # Everything scripts/bake_raw.py needs to redo the baking without a GPU.
-            np.savez(f"{job.output}.raw.npz", **{**raw, "vertices": raw["vertices"].astype(np.float32),
-                                                 "faces": raw["faces"].astype(np.int32),
-                                                 "voxel_size": np.float32(raw["voxel_size"])})
+            save_raw(raw, job.output, obj=True)
         if args.no_texture:
             return
         print(f"RAM before baking: {rss_gib():.1f} GiB")

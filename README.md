@@ -78,6 +78,7 @@ A run can use nearly all of the card's memory, so stop anything else that is usi
 | `--steps` | model default | Sampler steps for all phases |
 | `--no-texture` | off | Write only the raw mesh as OBJ |
 | `--save-raw` | off | Also write the raw OBJ, which can reach hundreds of MB, and a `.raw.npz` that `scripts/bake_raw.py` can bake again on the CPU with other options |
+| `--raw-only` | off | Write only the `.raw.npz` and exit, without the OBJ or baking, so the GPU is free before the CPU work. Bake it with `scripts/bake_raw.py` |
 
 ### Several images or seeds in one run
 

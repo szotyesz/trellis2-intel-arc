@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bake a raw mesh saved by `generate.py --save-raw` into a textured GLB.
+"""Bake a raw mesh saved by `generate.py --save-raw` or `--raw-only` into a textured GLB.
 
 Needs no GPU, so baking changes can be tried on a saved mesh without
 regenerating it. Runs in the cpu-tests container:
@@ -23,7 +23,7 @@ from backends.texture_baker import ALPHA_MODES, bake_to_glb  # noqa: E402
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("raw", help=".raw.npz written by generate.py --save-raw")
+    parser.add_argument("raw", help=".raw.npz written by generate.py --save-raw or --raw-only")
     parser.add_argument("output", help="Output GLB path")
     parser.add_argument("--texture-size", type=int, default=1024, choices=[512, 1024, 2048, 4096])
     parser.add_argument("--target-faces", type=int, default=200000)
